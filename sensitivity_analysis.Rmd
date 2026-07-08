@@ -1,0 +1,617 @@
+---
+title: "Bayesian Sensitivity Analysis (Objective iii)"
+author: "Valiao, Syrelle Kaye D."
+date: "2026-01-29"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    toc: true
+    toc_depth: 3
+    number_sections: true
+header-includes:
+  - \usepackage{amsmath}
+  - \usepackage{amssymb}
+  - \usepackage{graphicx}
+  - \usepackage{float}
+  - \usepackage{booktabs}
+editor_options:
+  markdown:
+    wrap: 72
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE, eval = TRUE,
+                      fig.pos = "H")
+
+# ── RERUN CONTROL ────────────────────────────────────────
+RERUN_SENSITIVITY <- FALSE    # Change to TRUE if you modify sensitivity specs
+# ───────────────────────────────────────────────────────────
+
+# Load CEVAE outputs (prerequisite)
+cevae_workspace <- "~/thesis_char/Thesis/cevae_workspace.RData"
+# Load INLA outputs (prerequisite)
+inla_workspace <- "~/thesis_char/Thesis/inla_workspace.RData"
+# Load existing Sensitivity results if available
+sens_workspace <- "~/thesis_char/Thesis/sensitivity_workspace.RData"
+
+if (file.exists(cevae_workspace)) {
+  load(cevae_workspace)
+  cat("✓ CEVAE workspace loaded\n")
+}
+
+if (file.exists(inla_workspace)) {
+  load(inla_workspace)
+  cat("✓ INLA workspace loaded\n")
+}
+
+if (file.exists(sens_workspace) && !RERUN_SENSITIVITY) {
+  load(sens_workspace)
+  cat("✓ Sensitivity workspace loaded (RERUN = FALSE)\n")
+}
+
+set.seed(0942)
+```
+
+```{r loading}
+library(INLA)
+library(tidyverse)
+library(patchwork)
+
+inla.setOption(num.threads = 10)
+inla.setOption(smtp = "taucs")
+
+# ── Shared helpers (defined here so chunk-skipping in axis1–3 is safe) ────────
+M     <- 5
+n_obs <- nrow(inla_input[inla_input$imputation_id == 1, ])
+df_m1 <- mate_results$df[mate_results$model == "M1"][1]
+t_crit <- qt(0.975, df = df_m1)
+sigma_seq <- seq(0, 0.55, length.out = 200)
+
+prepare_dat <- function(dat_m) {
+  active_cols <- c("z_mean_1", "z_mean_7", "z_mean_10")
+  dat_m %>%
+    mutate(
+      urban_bin     = as.numeric(urban == "Urban"),
+      z_active_mean = rowMeans(across(all_of(active_cols))),
+      z_std         = as.numeric(scale(z_active_mean)),
+      age_std       = as.numeric(scale(age)),
+      sex_bin       = as.numeric(sex == "Female"),
+      educ_std      = as.numeric(scale(as.numeric(as.character(education)))),
+      year_fact     = factor(survey_year),
+      prov_id       = as.integer(factor(province_code)),
+      region_id     = as.integer(factor(region)),
+      spatial_id    = if_else(is.na(prov_id), region_id, prov_id)
+    )
+}
+
+rubin_pool <- function(Q_vec, U_vec, df_adj) {
+  M_      <- length(Q_vec)
+  Q_bar   <- mean(Q_vec)
+  U_bar   <- mean(U_vec)
+  B       <- var(Q_vec)
+  T_var   <- U_bar + (1 + 1 / M_) * B
+  SE_pool <- sqrt(T_var)
+  t_crit  <- qt(0.975, df = df_adj)
+  data.frame(
+    MATE     = round(Q_bar,                    4),
+    SE       = round(SE_pool,                  4),
+    CI_low   = round(Q_bar - t_crit * SE_pool, 4),
+    CI_high  = round(Q_bar + t_crit * SE_pool, 4),
+    MATE_exp = round(exp(Q_bar),               4)
+  )
+}
+
+cat("Models available:", names(inla_fits), "\n")
+cat("Imputations per model:", length(inla_fits[["M1"]]), "\n")
+cat("MATE results:\n"); print(mate_results[, c("model", "MATE", "CI_low", "CI_high")])
+```
+
+```{r axis1, eval = RERUN_SENSITIVITY, cache=TRUE}
+# ── AXIS 1: Residual Confounding Sensitivity (Gustafson / McCandless) ─────────
+cat("\nAxis 1: Residual Confounding Sensitivity\n")
+
+sigma_gamma_vals <- c(0, 0.05, 0.10, 0.20, 0.50)
+
+mate_base <- inla_fits[["M1"]] |>
+  lapply(\(fit) fit$summary.fixed["urban_bin", "mean"]) |>
+  unlist() |> mean()
+
+se_base <- {
+  Q_vec <- inla_fits[["M1"]] |>
+    lapply(\(fit) fit$summary.fixed["urban_bin", "mean"]) |> unlist()
+  U_vec <- inla_fits[["M1"]] |>
+    lapply(\(fit) fit$summary.fixed["urban_bin", "sd"]^2) |> unlist()
+  B     <- var(Q_vec)
+  U_bar <- mean(U_vec)
+  sqrt(U_bar + (1 + 1/M) * B)
+}
+
+axis1_results <- data.frame(sigma_gamma = sigma_gamma_vals) |>
+  mutate(
+    SE            = sqrt(se_base^2 + sigma_gamma^2),
+    CI_low        = mate_base - t_crit * SE,
+    CI_high       = mate_base + t_crit * SE,
+    MATE          = mate_base,
+    MATE_exp      = exp(mate_base),
+    excludes_zero = ifelse(CI_low > 0, "Yes", "No")
+  ) |>
+  select(sigma_gamma, MATE, SE, CI_low, CI_high, MATE_exp, excludes_zero)
+
+cat("Residual confounding sensitivity (M1 base):\n")
+print(axis1_results)
+
+write.csv(axis1_results, "sensitivity_axis1_residual_confounding.csv", row.names = FALSE)
+
+sigma_tipping <- sqrt(
+  pmax((mate_base / t_crit)^2 - se_base^2, 0)
+)
+cat(sprintf("Tipping-point sigma_gamma: %.4f\n", sigma_tipping))
+```
+
+
+
+```{r axis2, eval = RERUN_SENSITIVITY, cache=FALSE}
+# AXIS 2: Spatial precision prior sensitivity
+# Vary PC prior: tight / base (current) / diffuse
+cat("\nAxis 2: Spatial Prior Sensitivity\n")
+
+spatial_priors <- list(
+  tight   = list(prec = list(prior = "pc.prec", param = c(0.5, 0.01))),
+  base    = list(prec = list(prior = "pc.prec", param = c(1.0, 0.01))),
+  diffuse = list(prec = list(prior = "pc.prec", param = c(2.0, 0.01)))
+)
+
+axis2_fits    <- list()
+axis2_results <- list()
+
+set.seed(0942)
+for (prior_name in names(spatial_priors)) {
+
+  cat(sprintf("\n  Fitting M1 with %s spatial prior...\n", prior_name))
+  prior_spec <- spatial_priors[[prior_name]]
+
+  formula_sens <- log_uic ~
+    urban_bin + z_std +
+    age_std + sex_bin + educ_std + year_fact +
+    f(spatial_id, model = "iid", hyper = prior_spec)
+
+  fits_prior <- vector("list", M)
+
+  for (m in 1:M) {
+    cat(sprintf("    Imputation %d/5...", m))
+    dat_m <- inla_input %>% filter(imputation_id == m) %>% prepare_dat()
+
+    fits_prior[[m]] <- inla(
+      formula_sens,
+      family            = "gaussian",
+      data              = dat_m,
+      weights           = dat_m$weight,
+      control.compute   = list(dic = TRUE, waic = TRUE),
+      control.predictor = list(compute = FALSE)
+    )
+    cat(sprintf(" DIC = %.2f\n", fits_prior[[m]]$dic$dic))
+  }
+
+  axis2_fits[[prior_name]] <- fits_prior
+
+  mate_tbl <- lapply(1:M, function(m) {
+    row <- fits_prior[[m]]$summary.fixed["urban_bin", ]
+    data.frame(Q = row$mean, U = row$sd^2)
+  }) %>% bind_rows()
+
+  # Compute df for this prior
+  n_par  <- nrow(fits_prior[[1]]$summary.fixed)
+  B      <- var(mate_tbl$Q)
+  U_bar  <- mean(mate_tbl$U)
+  T_var  <- U_bar + (1 + 1/M) * B
+  lambda <- (1 + 1/M) * B / T_var
+  df_old <- (M - 1) / max(lambda, 1e-10)^2
+  df_obs <- (n_obs - n_par) * (1 - lambda)
+  df_adj <- (df_old * df_obs) / (df_old + df_obs)
+
+  res             <- rubin_pool(mate_tbl$Q, mate_tbl$U, df_adj)
+  res$prior       <- prior_name
+  res$prior_param <- sprintf("P(sigma > %.1f) = 0.01",
+                             spatial_priors[[prior_name]]$prec$param[1])
+  axis2_results[[prior_name]] <- res
+}
+
+axis2_tbl <- bind_rows(axis2_results) %>%
+  select(prior, prior_param, MATE, SE, CI_low, CI_high, MATE_exp)
+
+cat("\nSpatial prior sensitivity:\n")
+print(axis2_tbl)
+write.csv(axis2_tbl, "sensitivity_axis2_spatial_prior.csv", row.names = FALSE)
+```
+
+
+```{r axis3, eval = RERUN_SENSITIVITY, cache=FALSE}
+library(readr)
+library(tidyverse)
+# AXIS 3: Latent dimension selection sensitivity
+# KL threshold: > 50 / > 100 / > 200 vs active dims (4,7,9)
+cat("\nAxis 3: Latent Dimension Selection Sensitivity\n")
+
+# Load kl_df (rebuild from z_df if needed)
+z_mean_cols <- paste0("z_mean_", 1:10)
+z_sd_cols   <- paste0("z_sd_",   1:10)
+
+kl_df <- z_df %>%
+  group_by(imputation_id) %>%
+  summarise(across(all_of(z_mean_cols), mean),
+            across(all_of(z_sd_cols),   mean)) %>%
+  pivot_longer(-imputation_id, names_to = "variable", values_to = "value") %>%
+  mutate(
+    dim  = as.integer(str_extract(variable, "\\d+")),
+    type = if_else(str_starts(variable, "z_mean"), "mean", "sd")
+  ) %>%
+  select(-variable) %>%
+  pivot_wider(names_from = type, values_from = value) %>%
+  mutate(kl = 0.5 * (mean^2 + sd^2 - log(sd^2) - 1))
+
+# Active dims per threshold (averaged across imputations)
+kl_mean_by_dim <- kl_df %>%
+  group_by(dim) %>%
+  summarise(kl_mean = mean(kl))
+
+cat("KL divergence by dimension:\n")
+print(kl_mean_by_dim)
+
+dim_sets <- list(
+  "Manual (1,7,10)" = c(1,7,10),
+  "KL > 0.25" = kl_mean_by_dim$dim[kl_mean_by_dim$kl_mean > 0.25],
+  "KL > 0.5" = kl_mean_by_dim$dim[kl_mean_by_dim$kl_mean > 0.5],
+  "KL > 1.0" = kl_mean_by_dim$dim[kl_mean_by_dim$kl_mean > 1.0]
+)
+
+cat("\nDimension sets per threshold:\n")
+for (nm in names(dim_sets)) cat(sprintf("  %s: dims %s\n", nm,
+                                         paste(dim_sets[[nm]], collapse = ", ")))
+
+set.seed(0942)
+axis3_results <- lapply(names(dim_sets), function(set_name) {
+
+  dims     <- dim_sets[[set_name]]
+  
+  if (length(dims) == 0) {
+    cat(sprintf("\n  Skipping '%s' — no dimensions exceeded threshold.\n", set_name))
+    return(NULL)
+  }
+  dim_cols <- paste0("z_mean_", dims)
+
+  cat(sprintf("\n  Fitting: %s (dims: %s)...\n", set_name,
+              paste(dims, collapse = ", ")))
+
+  # Redefine prepare_dat with this dim set
+  prepare_dat_dims <- function(dat_m, dim_cols) {
+    dat_m %>%
+      mutate(
+        urban_bin     = as.numeric(urban == "Urban"),
+        z_active_mean = rowMeans(across(all_of(dim_cols))),
+        z_std         = as.numeric(scale(z_active_mean)),
+        age_std       = as.numeric(scale(age)),
+        sex_bin       = as.numeric(sex == "Female"),
+        educ_std      = as.numeric(scale(as.numeric(as.character(education)))),
+        year_fact     = factor(survey_year),
+        prov_id       = as.integer(factor(province_code)),
+        region_id     = as.integer(factor(region)),
+        spatial_id = if_else(is.na(prov_id), region_id, prov_id)
+      )
+  }
+
+  fits_dims <- vector("list", M)
+
+  for (m in 1:M) {
+    cat(sprintf("    Imputation %d/5...", m))
+    dat_m <- inla_input %>% filter(imputation_id == m) %>% 
+      prepare_dat_dims(dim_cols = dim_cols)
+
+    fits_dims[[m]] <- inla(
+      log_uic ~ urban_bin + z_std +
+        age_std + sex_bin + educ_std + year_fact +
+        f(spatial_id, model = "iid",
+          hyper = list(prec = list(prior = "pc.prec", param = c(1, 0.01)))),
+      family            = "gaussian",
+      data              = dat_m,
+      weights           = dat_m$weight,
+      control.compute   = list(dic = TRUE, waic = TRUE),
+      control.predictor = list(compute = FALSE)
+    )
+    cat(sprintf(" DIC = %.2f\n", fits_dims[[m]]$dic$dic))
+  }
+
+  mate_tbl <- lapply(1:M, function(m) {
+    row <- fits_dims[[m]]$summary.fixed["urban_bin", ]
+    data.frame(Q = row$mean, U = row$sd^2)
+  }) %>% bind_rows()
+
+  n_par  <- nrow(fits_dims[[1]]$summary.fixed)
+  B      <- var(mate_tbl$Q)
+  U_bar  <- mean(mate_tbl$U)
+  T_var  <- U_bar + (1 + 1/M) * B
+  lambda <- (1 + 1/M) * B / T_var
+  df_old <- (M - 1) / max(lambda, 1e-10)^2
+  df_obs <- (n_obs - n_par) * (1 - lambda)
+  df_adj <- (df_old * df_obs) / (df_old + df_obs)
+
+  res          <- rubin_pool(mate_tbl$Q, mate_tbl$U, df_adj)
+  res$dim_set  <- set_name
+  res$dims     <- paste(dims, collapse = ", ")
+  res$n_dims   <- length(dims)
+  res
+
+}) %>% bind_rows() %>%
+  select(dim_set, dims, n_dims, MATE, SE, CI_low, CI_high, MATE_exp)
+
+cat("\nLatent dimension sensitivity:\n")
+print(axis3_results)
+write.csv(axis3_results, "sensitivity_axis3_dim_selection.csv", row.names = FALSE)
+
+
+cat("SENSITIVITY ANALYSIS SUMMARY\n")
+
+cat("\nAxis 1 — Residual Confounding:\n");  print(axis1_results)
+cat("\nAxis 2 — Spatial Prior:\n");         print(axis2_tbl)
+cat("\nAxis 3 — Dim Selection:\n");         print(axis3_results)
+
+saveRDS(axis2_fits, "sensitivity_axis2_fits.RDS")
+cat("\n All sensitivity outputs saved.\n")
+```
+
+```{r visualization, cache=FALSE}
+library(tidyverse)
+library(patchwork)
+
+col_yes  <- "#3c0f5b"   # CI excludes zero
+col_no   <- "#E85D75"  # CI includes zero
+col_tip  <- "black"  # tipping point
+col_base <- "#A4CD55"
+
+# PANEL 1: Axis 1 — CI ribbon as sigma_gamma increases
+
+mate_base    <- axis1_results$MATE[axis1_results$sigma_gamma == 0]
+se_base       <- axis1_results$SE[axis1_results$sigma_gamma == 0]
+t_crit        <- qt(0.975, df = df_m1)
+sigma_tipping <- sqrt(pmax((mate_base / t_crit)^2 - se_base^2, 0))
+
+cat(sprintf("Tipping point sigma_gamma: %.4f\n", sigma_tipping))
+
+ribbon_df <- data.frame(sigma_gamma = sigma_seq) %>%
+  mutate(
+    SE      = sqrt(se_base^2 + sigma_gamma^2),
+    CI_low  = mate_base - t_crit * SE,
+    CI_high = mate_base + t_crit * SE,
+    sig     = CI_low > 0
+  )
+
+# Observed points from axis1_results
+obs_df <- axis1_results %>%
+  mutate(sig = CI_low > 0)
+
+p_axis1 <- ggplot(ribbon_df, aes(x = sigma_gamma)) +
+
+  geom_ribbon(data = filter(ribbon_df, sigma_gamma <= sigma_tipping),
+              aes(ymin = CI_low, ymax = CI_high),
+              fill = col_yes, alpha = 0.15) +
+  geom_ribbon(data = filter(ribbon_df, sigma_gamma >= sigma_tipping),
+              aes(ymin = CI_low, ymax = CI_high),
+              fill = col_no, alpha = 0.15) +
+
+  geom_hline(yintercept = mate_base,
+             color = col_base, linewidth = 0.8, linetype = "solid") +
+  geom_line(aes(y = CI_low),  color = col_base, linewidth = 0.5, linetype = "dashed") +
+  geom_line(aes(y = CI_high), color = col_base, linewidth = 0.5, linetype = "dashed") +
+  geom_hline(yintercept = 0, color = "grey60",
+             linewidth = 0.4, linetype = "dotted") +
+
+  geom_vline(xintercept = sigma_tipping, color = col_tip,
+             linewidth = 0.7, linetype = "dashed") +
+  annotate("text", x = sigma_tipping + 0.01, y = -0.55,
+           label = sprintf("Tipping\npoint\n\u03c3\u03b3 = %.4f", sigma_tipping),
+           hjust = 0, size = 4.2, color = col_tip, lineheight = 1.2) +
+
+  geom_point(data = obs_df,
+             aes(y = MATE, color = sig), size = 3.5, shape = 18) +
+  geom_point(data = obs_df,
+             aes(y = CI_low,  color = sig), size = 2.5, shape = 1) +
+  geom_point(data = obs_df,
+             aes(y = CI_high, color = sig), size = 2.5, shape = 1) +
+
+  scale_color_manual(values = c("TRUE" = col_yes, "FALSE" = col_no),
+                     labels = c("TRUE" = "CI excludes 0",
+                                "FALSE" = "CI includes 0")) +
+
+  scale_x_continuous(
+    limits = c(-0.01, 0.55),
+    breaks = sort(c(seq(0, 0.50, 0.10), round(sigma_tipping, 4))),
+    labels = c(as.character(seq(0, 0.50, 0.10)),
+           sprintf("%.3f*", sigma_tipping))
+  ) +
+
+  coord_cartesian(ylim = c(-0.75, 1.1)) +
+  labs(
+    title    = "Axis 1: Residual Confounding Sensitivity",
+    subtitle = "MATE point estimate fixed; CI widens as unmodelled confounding \u03c3\u03b3 increases",
+    x        = "Residual Confounding SD (\u03c3\u03b3)",
+    y        = "MATE on log(UIC)",
+    color    = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title        = element_text(face = "bold", size = 14),
+    plot.subtitle     = element_text(size = 10, color = "grey40"),
+    axis.text         = element_text(size = 11),
+    axis.title        = element_text(size = 11),
+    panel.grid.minor  = element_blank(),
+    legend.position   = "right",
+    legend.justification = "top",
+    legend.background = element_rect(fill = "white", color = NA),
+    legend.text       = element_text(size = 10)
+  )
+
+# PANEL 2: Axis 2 — Spatial prior sensitivity dot plot
+axis2_plot_df <- axis2_tbl %>%
+  mutate(prior = factor(prior, levels = c("tight", "base", "diffuse"),
+                        labels = c("Tight\nP(\u03c3>0.5)=0.01",
+                                   "Base\nP(\u03c3>1.0)=0.01",
+                                   "Diffuse\nP(\u03c3>2.0)=0.01")))
+
+p_axis2 <- ggplot(axis2_plot_df,
+                  aes(x = MATE, y = prior)) +
+
+  geom_vline(xintercept = 0, color = "grey60",
+             linewidth = 0.4, linetype = "dotted") +
+  geom_vline(xintercept = mate_base, color = col_base,
+             linewidth = 0.5, linetype = "dashed", alpha = 0.6) +
+
+  geom_linerange(aes(xmin = CI_low, xmax = CI_high),
+                 color = col_yes, linewidth = 1.2, alpha = 0.8) +
+  geom_point(aes(x = MATE), color = col_yes,
+             size = 4, shape = 18) +
+
+  geom_text(aes(x = CI_high + 0.002,
+                label = sprintf("%.4f (%.4f, %.4f)",
+                                MATE, CI_low, CI_high)),
+            hjust = 0, size = 5, color = "grey20") +
+
+  scale_x_continuous(limits = c(0.08, 0.52),
+                     breaks = seq(0.10, 0.45, 0.05)) +
+  labs(
+    title    = "Axis 2: Spatial Prior Sensitivity",
+    subtitle = "M1 refitted under tight / base / diffuse PC priors on spatial precision",
+    x        = "MATE on log(UIC)",
+    y        = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title    = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(size = 12, color = "grey40"),
+    axis.text.y   = element_text(size = 13, lineheight = 1.3),
+    axis.text.x   = element_text(size = 12),
+    axis.title.x  = element_text(size = 12),
+    legend.position  = "none",
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    plot.margin = margin(10, 40, 10, 40)
+  )
+
+# PANEL 3: Axis 3 — Dim selection dot plot
+axis3_plot_df <- axis3_results %>%
+  mutate(
+    dim_set = factor(dim_set,
+                     levels = rev(c("Manual (1,7,10)",
+                                    "KL > 0.25", "KL > 0.5", "KL > 1.0"))),
+    label = sprintf("Dims: %s  (n=%d)", dims, n_dims)
+  )
+
+p_axis3 <- ggplot(axis3_plot_df,
+                  aes(x = MATE, y = dim_set)) +
+  geom_vline(xintercept = 0, color = "grey60",
+             linewidth = 0.4, linetype = "dotted") +
+  geom_vline(xintercept = mate_base, color = col_base,
+             linewidth = 0.5, linetype = "dashed", alpha = 0.6) +
+  geom_linerange(aes(xmin = CI_low, xmax = CI_high),
+                 color = col_yes, linewidth = 1.2, alpha = 0.8,
+                 position = position_dodge(width = 0.6)) +
+  geom_point(aes(x = MATE), color = col_yes,
+             size = 4, shape = 18,
+             position = position_dodge(width = 0.6)) +
+  geom_text(
+    aes(x = CI_high + 0.01,
+        label = sprintf("%.4f (%.4f, %.4f)\n[%s]",
+                        MATE, CI_low, CI_high, label)),
+    hjust = 0, size = 5, color = "grey20", lineheight = 1.0,
+    position = position_dodge(width = 0.6)
+  ) +
+  scale_x_continuous(limits = c(0.05, 0.55),
+                     breaks = seq(0.10, 0.50, 0.10)) +
+  scale_y_discrete(expand = expansion(add = 1.8)) +
+  labs(
+    title    = "Axis 3: Latent Dimension Selection Sensitivity",
+    subtitle = "M1 refitted using dims selected by KL threshold vs manual selection",
+    x        = "MATE on log(UIC)",
+    y        = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title         = element_text(face = "bold", size = 16, margin = margin(b = 10), 
+                                      hjust = 0),
+    plot.subtitle      = element_text(size = 12, color = "grey40", margin = margin(b = 20),
+                                      hjust = 0),
+    legend.position    = "none",
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor   = element_blank(),
+    axis.text.y        = element_text(size = 12),
+    axis.text.x        = element_text(size = 12),
+    axis.title.x       = element_text(size = 12, margin = margin(t = 15)),
+    plot.margin        = margin(30, 60, 30, 30)
+  )
+
+# Step 3: Combine cleanly
+combined_sensitivity <- (p_axis1 / p_axis2 / p_axis3) +
+  plot_layout(heights = c(2.2, 1, 1)) +
+  plot_annotation(
+    title    = "Bayesian Sensitivity Analysis — MATE of Urbanicity on log(UIC)",
+    subtitle = "Following Gustafson et al. | ENNS 2018–2021 | CEVAE + INLA",
+    caption  = sprintf(
+      "Dashed vertical line = base M1 estimate (%.4f) | *Tipping point at \u03c3\u03b3 = %.4f",
+      mate_base, sigma_tipping
+    ),
+    theme = theme(
+      plot.title    = element_text(face = "bold", size = 15),
+      plot.subtitle = element_text(size = 11, color = "grey40"),
+      plot.caption  = element_text(size = 11, color = "grey50")
+    )
+  )
+
+# Save each sensitivity axis separately
+ggsave("sensitivity_axis1.pdf", p_axis1,
+       width = 8, height = 6, device = "pdf")
+cat("✓ Saved: sensitivity_axis1.pdf\n")
+
+ggsave("sensitivity_axis2.pdf", p_axis2,
+       width = 8, height = 6, device = "pdf")
+cat("✓ Saved: sensitivity_axis2.pdf\n")
+
+ggsave("sensitivity_axis3.pdf", p_axis3,
+       width = 7, height = 5, device = "pdf")
+cat("✓ Saved: sensitivity_axis3.pdf\n")
+
+# Then still save the combined panel if you want
+ggsave("sensitivity_analysis_plot.pdf", combined_sensitivity,
+       width = 13, height = 13, device = "pdf")
+cat("✓ Saved: sensitivity_analysis_plot.pdf\n")
+```
+
+```{r save-sensitivity-workspace, include=FALSE}
+workspace_path <- "~/thesis_char/Thesis/sensitivity_workspace.RData"
+
+objects_to_save <- c(
+  # ── AXIS 1: Residual Confounding ──────────────────────────────
+  "axis1_results",          # Main sensitivity table
+  "mate_base",              # Base estimate
+  "se_base",                # Base SE
+  "sigma_tipping",          # Tipping-point calculation
+  "sigma_seq",              # Sigma sequence for plotting
+  
+  # ── AXIS 2: Spatial Prior Sensitivity ─────────────────────────
+  "axis2_fits",             # Fits under different priors
+  "axis2_results",          # Pooled results per prior
+  "axis2_tbl",              # Summary table
+  
+  # ── AXIS 3: Latent Dimension Selection ────────────────────────
+  "axis3_results",          # Main dimension sensitivity table
+  "kl_df",                  # Full KL divergence data
+  "kl_mean_by_dim",         # KL means by dimension
+  "dim_sets"                # Dimension sets used
+)
+
+# Only save what exists
+objects_to_save <- objects_to_save[objects_to_save %in% ls()]
+
+save(list = objects_to_save, file = workspace_path)
+
+cat("✓ Sensitivity workspace saved:", round(file.info(workspace_path)$size / 1e6, 1), "MB\n")
+cat("Objects saved:", length(objects_to_save), "\n")
+```
+
+

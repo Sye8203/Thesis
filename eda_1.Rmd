@@ -1,0 +1,643 @@
+---
+title: "Exploratory Data Analysis"
+author: "Valiao, Syrelle Kaye D."
+date: "2026-01-29"
+output:
+  html_document:
+    self_contained: true
+    code_folding: hide
+    toc: true
+    toc_float: true
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo       = TRUE,
+  warning    = FALSE,
+  message    = FALSE,
+  fig.align  = "center",
+  fig.width  = 7,
+  fig.height = 5,
+  out.width  = "\\linewidth", 
+  dpi        = 300,
+  fig.pos    = "H"             
+)
+```
+
+```{r libraries}
+library(tidyverse)
+library(naniar)
+library(patchwork)
+library(corrplot)
+library(ggridges)
+library(viridis)
+library(kableExtra)
+library(readr)
+library(scales)
+library(moments)   
+library(dagitty)
+library(dplyr)
+```
+
+```{r load-data}
+analysis_data <- read_csv("analysis_data_final.csv")
+```
+
+## 1. Outcome Distribution (UIC)
+
+```{r uic-filter}
+# Restrict to observations with complete UIC
+uic_data <- analysis_data %>% filter(!is.na(uic_raw))
+cat("Sample size with complete UIC:", nrow(uic_data), "\n")
+```
+
+```{r uic-summary-raw}
+# Summary statistics — raw UIC
+uic_data %>%
+  summarise(
+    n        = n(),
+    mean     = mean(uic_raw),
+    sd       = sd(uic_raw),
+    median   = median(uic_raw),
+    q25      = quantile(uic_raw, 0.25),
+    q75      = quantile(uic_raw, 0.75),
+    min      = min(uic_raw),
+    max      = max(uic_raw),
+    cv       = sd(uic_raw) / mean(uic_raw),
+    skewness = skewness(uic_raw),
+    kurtosis = kurtosis(uic_raw)
+  ) %>%
+  pivot_longer(everything(), names_to = "Statistic", values_to = "Value") %>%
+  mutate(Value = round(Value, 2)) %>%
+  kable(format = "simple", caption = "UIC Summary Statistics")
+```
+
+```{r uic-summary-log}
+# Summary statistics — log-transformed UIC
+uic_data %>%
+  summarise(
+    n      = n(),
+    mean   = mean(log_uic),
+    sd     = sd(log_uic),
+    median = median(log_uic),
+    q25    = quantile(log_uic, 0.25),
+    q75    = quantile(log_uic, 0.75),
+    min    = min(log_uic),
+    max    = max(log_uic)
+  ) %>%
+  pivot_longer(everything(), names_to = "Statistic", values_to = "Value") %>%
+  mutate(Value = round(Value, 3)) %>%
+  kable(format = "simple", caption = "Log(UIC) Summary Statistics")
+```
+
+```{r uic-who-classification}
+# WHO iodine status classification
+uic_categories <- uic_data %>%
+  mutate(
+    uic_category = case_when(
+      uic_raw < 100                      ~ "Insufficient (<100)",
+      uic_raw >= 100 & uic_raw < 200     ~ "Adequate (100-199)",
+      uic_raw >= 200 & uic_raw < 300     ~ "Above requirements (200-299)",
+      uic_raw >= 300                     ~ "Excessive (>=300)"
+    ),
+    uic_category = factor(uic_category,
+                          levels = c("Insufficient (<100)",
+                                     "Adequate (100-199)",
+                                     "Above requirements (200-299)",
+                                     "Excessive (>=300)"))
+  )
+
+uic_categories %>%
+  count(uic_category) %>%
+  mutate(percent = round(n / sum(n) * 100, 1)) %>%
+  kable(format = "simple",
+        caption = "UIC Category Distribution (WHO thresholds)")
+```
+
+```{r uic-distribution-plots, fig.height=8}
+# Four-panel distribution plot: raw vs log-transformed, histogram vs Q-Q
+p1 <- ggplot(uic_data, aes(x = uic_raw)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 50,
+                 fill = "steelblue", alpha = 0.7) +
+  geom_density(color = "red", linewidth = 1) +
+  geom_vline(xintercept = median(uic_data$uic_raw),
+             linetype = "dashed", color = "darkgreen", linewidth = 1) +
+  annotate("text", x = median(uic_data$uic_raw), y = 0.003,
+           label = paste("Median =", round(median(uic_data$uic_raw), 1)),
+           hjust = -0.1, color = "darkgreen") +
+  labs(title = "Distribution of Raw UIC",
+       subtitle = paste0("n = ", nrow(uic_data)),
+       x = "UIC (\u03bcg/L)", y = "Density") +
+  theme_minimal()
+
+p2 <- ggplot(uic_data, aes(x = log_uic)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 50,
+                 fill = "coral", alpha = 0.7) +
+  geom_density(color = "darkred", linewidth = 1) +
+  geom_vline(xintercept = mean(uic_data$log_uic),
+             linetype = "dashed", color = "darkgreen", linewidth = 1) +
+  annotate("text", x = mean(uic_data$log_uic), y = 0.3,
+           label = paste("Mean =", round(mean(uic_data$log_uic), 2)),
+           hjust = -0.1, color = "darkgreen") +
+  labs(title = "Distribution of Log(UIC)",
+       subtitle = "More normally distributed",
+       x = "Log(UIC)", y = "Density") +
+  theme_minimal()
+
+p3 <- ggplot(uic_data, aes(sample = uic_raw)) +
+  stat_qq() + stat_qq_line(color = "red") +
+  labs(title = "Q-Q Plot: Raw UIC",
+       x = "Theoretical Quantiles", y = "Sample Quantiles") +
+  theme_minimal()
+
+p4 <- ggplot(uic_data, aes(sample = log_uic)) +
+  stat_qq() + stat_qq_line(color = "red") +
+  labs(title = "Q-Q Plot: Log(UIC)",
+       x = "Theoretical Quantiles", y = "Sample Quantiles") +
+  theme_minimal()
+
+print((p1 | p2) / (p3 | p4))
+```
+
+## 2. Exposure Variation (Urban/Rural)
+
+```{r urban-distribution}
+# Overall urban/rural split
+analysis_data %>%
+  count(urban) %>%
+  mutate(area_type = ifelse(urban == 1, "Urban", "Rural"),
+         percent   = round(n / sum(n) * 100, 1)) %>%
+  select(area_type, n, percent) %>%
+  kable(format = "simple", caption = "Urban/Rural Distribution")
+```
+
+```{r uic-by-urban}
+# UIC summary stratified by urbanicity
+uic_data %>%
+  group_by(urban) %>%
+  summarise(
+    n          = n(),
+    mean_uic   = mean(uic_raw),
+    sd_uic     = sd(uic_raw),
+    median_uic = median(uic_raw),
+    q25        = quantile(uic_raw, 0.25),
+    q75        = quantile(uic_raw, 0.75),
+    .groups    = "drop"
+  ) %>%
+  mutate(area_type = ifelse(urban == 1, "Urban", "Rural"),
+         across(where(is.numeric) & !c(urban, n), ~round(., 2))) %>%
+  select(area_type, n, mean_uic, sd_uic, median_uic, q25, q75) %>%
+  kable(format = "simple", caption = "UIC by Urban/Rural Status")
+```
+
+```{r urban-ttest}
+# Two-sample t-test: urban vs rural UIC
+t_test_result <- t.test(uic_raw ~ urban, data = uic_data)
+cat("T-test (Urban vs Rural):",
+    "\n  t        =", round(t_test_result$statistic, 3),
+    "\n  p        =", format.pval(t_test_result$p.value, digits = 3),
+    "\n  Mean diff=", round(diff(t_test_result$estimate), 2), "ug/L\n")
+```
+
+```{r urban-distribution-plots, fig.height=8}
+# Density, boxplot, and violin plots by urbanicity
+urban_colors    <- c("Rural" = "#E69F00", "Urban" = "#56B4E9")
+uic_data_label  <- uic_data %>%
+  mutate(area_type = factor(ifelse(urban == 1, "Urban", "Rural")))
+
+p6 <- ggplot(uic_data_label, aes(x = log_uic, fill = area_type)) +
+  geom_density(alpha = 0.6) +
+  scale_fill_manual(values = urban_colors) +
+  labs(title = "UIC Distribution by Urbanization",
+       x = "Log(UIC)", y = "Density", fill = "Area Type") +
+  theme_minimal()
+
+p7 <- ggplot(uic_data_label,
+             aes(x = area_type, y = uic_raw, fill = area_type)) +
+  geom_boxplot(alpha = 0.7) +
+  scale_y_log10(labels = comma) +
+  scale_fill_manual(values = urban_colors) +
+  labs(title = "UIC by Urban/Rural Status",
+       x = "Area Type", y = "UIC (\u03bcg/L, log scale)") +
+  theme_minimal() + theme(legend.position = "none")
+
+p8 <- ggplot(uic_data_label,
+             aes(x = area_type, y = log_uic, fill = area_type)) +
+  geom_violin(alpha = 0.6) +
+  geom_boxplot(width = 0.2, alpha = 0.8) +
+  scale_fill_manual(values = urban_colors) +
+  labs(title = "Log(UIC) by Urbanization",
+       x = "Area Type", y = "Log(UIC)") +
+  theme_minimal() + theme(legend.position = "none")
+
+print(p6 / (p7 | p8))
+```
+
+```{r uic-category-by-urban}
+# WHO category distribution stacked bar by urbanicity
+uic_categories %>%
+  mutate(area_type = factor(ifelse(urban == 1, "Urban", "Rural"))) %>%
+  count(area_type, uic_category) %>%
+  group_by(area_type) %>%
+  mutate(percent = n / sum(n) * 100) %>%
+  ggplot(aes(x = area_type, y = percent, fill = uic_category)) +
+  geom_bar(stat = "identity", position = "stack") +
+  geom_text(
+    aes(label = sprintf("%.1f%%", percent)),
+    position = position_stack(vjust = 0.5),  # ggplot handles midpoint automatically
+    color = "white",
+    fontface = "bold",
+    size = 3.5
+  ) +
+  scale_fill_viridis_d() +
+  labs(title = "UIC Category Distribution by Urban/Rural Status",
+       x = "Area Type", y = "Percentage (%)", fill = "UIC Category") +
+  theme_minimal()
+```
+
+## 3. Regional Patterns
+
+```{r regional-summary}
+# Mean UIC and urbanization rate by region
+regional_summary <- uic_data %>%
+  group_by(region) %>%
+  summarise(
+    n          = n(),
+    mean_uic   = mean(uic_raw),
+    median_uic = median(uic_raw),
+    sd_uic     = sd(uic_raw),
+    pct_urban  = mean(urban) * 100,
+    .groups    = "drop"
+  ) %>%
+  arrange(desc(mean_uic))
+
+regional_summary %>%
+  mutate(across(where(is.numeric) & !c(n), ~round(., 2))) %>%
+  kable(format = "simple", caption = "UIC by Region")
+```
+
+```{r regional-plots, fig.height=6}
+# Mean UIC by region (colored by % urban) and boxplot by region
+p10 <- regional_summary %>%
+  mutate(region = fct_reorder(factor(region), mean_uic)) %>%
+  ggplot(aes(x = region, y = mean_uic, fill = pct_urban)) +
+  geom_col() +
+  scale_fill_viridis_c(option = "plasma") +
+  coord_flip() +
+  labs(title = "Mean UIC by Region",
+       subtitle = "Color indicates urbanization percentage",
+       x = "Region", y = "Mean UIC (\u03bcg/L)", fill = "% Urban") +
+  theme_minimal()
+
+p11 <- uic_data %>%
+  ggplot(aes(x = region, y = log_uic, fill = region)) +
+  geom_boxplot(alpha = 0.7) +
+  scale_fill_viridis_d() +
+  labs(title = "Log(UIC) Distribution by Region",
+       x = "Region", y = "Log(UIC)") +
+  theme_minimal() + theme(legend.position = "none")
+
+print(p10)
+print(p11)
+```
+
+```{r urban-rural-by-region}
+# Urban-rural UIC comparison within each region
+regional_urban_rural <- uic_data %>%
+  mutate(area_type = ifelse(urban == 1, "Urban", "Rural")) %>%
+  group_by(region, area_type) %>%
+  summarise(n          = n(),
+            mean_uic   = mean(uic_raw),
+            median_uic = median(uic_raw),
+            .groups    = "drop")
+
+regional_urban_rural %>%
+  pivot_wider(names_from  = area_type,
+              values_from = c(n, mean_uic, median_uic),
+              names_sep   = "_") %>%
+  arrange(desc(mean_uic_Urban)) %>%
+  mutate(across(where(is.numeric) & !starts_with("n_"), ~round(., 2))) %>%
+  kable(format = "simple", caption = "Urban-Rural UIC by Region")
+```
+
+```{r urban-rural-region-plot}
+# Dodged bar chart: mean UIC by region and area type
+regional_urban_rural %>%
+  ggplot(aes(x = region, y = mean_uic, fill = area_type)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = c("Rural" = "#E69F00", "Urban" = "#56B4E9")) +
+  labs(title = "Mean UIC by Region and Urbanization",
+       x = "Region", y = "Mean UIC (\u03bcg/L)", fill = "Area Type") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## 4. Temporal Patterns (Survey Year)
+
+```{r temporal-summary}
+# UIC summary by survey year
+uic_data %>%
+  group_by(survey_year) %>%
+  summarise(
+    n          = n(),
+    mean_uic   = mean(uic_raw),
+    median_uic = median(uic_raw),
+    sd_uic     = sd(uic_raw),
+    pct_urban  = mean(urban) * 100,
+    .groups    = "drop"
+  ) %>%
+  mutate(across(where(is.numeric) & !c(survey_year, n), ~round(., 2))) %>%
+  kable(format = "simple", caption = "UIC by Survey Year")
+
+```
+
+```{r temporal-plot}
+# Boxplot of log(UIC) by survey year and urbanicity
+uic_data %>%
+  mutate(area_type = factor(ifelse(urban == 1, "Urban", "Rural"))) %>%
+  ggplot(aes(x = factor(survey_year), y = log_uic, fill = area_type)) +
+  geom_boxplot(alpha = 0.7) +
+  scale_fill_manual(values = c("Rural" = "#E69F00", "Urban" = "#56B4E9")) +
+  labs(title = "Log(UIC) by Survey Year and Urbanization",
+       x = "Survey Year", y = "Log(UIC)", fill = "Area Type") +
+  theme_minimal()
+```
+
+## 5. Demographic Patterns
+
+```{r age-group-uic}
+# UIC by age group
+uic_age_data <- uic_data %>%
+  mutate(
+    age_group = cut(age,
+                    breaks = c(0, 5, 12, 18, 30, 50, 70, Inf),
+                    labels = c("0-5", "6-12", "13-18",
+                               "19-30", "31-50", "51-70", "70+"),
+                    right  = FALSE)
+  )
+
+uic_age_data %>%
+  group_by(age_group) %>%
+  summarise(n          = n(),
+            mean_uic   = mean(uic_raw),
+            median_uic = median(uic_raw),
+            .groups    = "drop") %>%
+  mutate(across(where(is.numeric) & !n, ~round(., 2))) %>%
+  kable(format = "simple", caption = "UIC by Age Group")
+```
+
+```{r age-group-plot}
+ggplot(uic_age_data, aes(x = age_group, y = log_uic, fill = age_group)) +
+  geom_boxplot(alpha = 0.7) +
+  scale_fill_viridis_d() +
+  labs(title = "Log(UIC) by Age Group",
+       x = "Age Group (years)", y = "Log(UIC)") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none")
+```
+
+```{r sex-uic}
+# UIC by sex
+uic_data %>%
+  group_by(sex) %>%
+  summarise(n          = n(),
+            mean_uic   = mean(uic_raw),
+            median_uic = median(uic_raw),
+            sd_uic     = sd(uic_raw),
+            .groups    = "drop") %>%
+  mutate(across(where(is.numeric) & !n, ~round(., 2))) %>%
+  kable(format = "simple", caption = "UIC by Sex")
+```
+
+```{r sex-ttest}
+# Two-sample t-test: UIC by sex
+sex_t <- t.test(uic_raw ~ sex, data = uic_data)
+cat("T-test by Sex:",
+    "\n  t =", round(sex_t$statistic, 3),
+    "\n  p =", format.pval(sex_t$p.value, digits = 3), "\n")
+
+t.test(log_uic ~ sex, data = uic_data)
+```
+
+```{r sex-plot}
+ggplot(uic_data, aes(x = sex, y = log_uic, fill = sex)) +
+  geom_violin(alpha = 0.6) +
+  geom_boxplot(width = 0.2, alpha = 0.8) +
+  scale_fill_manual(values = c("Male" = "#00BFC4", "Female" = "#F8766D")) +
+  labs(title = "Log(UIC) by Sex", x = "Sex", y = "Log(UIC)") +
+  theme_minimal() + theme(legend.position = "none")
+```
+
+```{r education-by-urban}
+# Education level by urbanicity (key confounder in adjustment set)
+analysis_data |>
+  filter(!is.na(education)) |>
+  mutate(area_type = ifelse(urban == 1, "Urban", "Rural")) |>
+  group_by(area_type) |>
+  summarise(
+    n           = n(),
+    mean_educ   = mean(education),
+    median_educ = median(education),
+    sd_educ     = sd(education),
+    .groups     = "drop"
+  ) |>
+  mutate(across(where(is.numeric) & !n, ~round(., 2))) |>
+  kable(format = "simple",
+        caption = "Education Level by Urban/Rural Status")
+```
+
+## 6. Inflammation Proxy Assessment
+
+```{r proxy-by-urban}
+# Hemoglobin and serum retinol stratified by urbanicity
+# Establishes that proxies vary by exposure, supporting their use in CEVAE
+analysis_data |>
+  filter(!is.na(hemoglobin), !is.na(serum_retinol)) |>
+  mutate(area_type = ifelse(urban == 1, "Urban", "Rural")) |>
+  group_by(area_type) |>
+  summarise(
+    n         = n(),
+    mean_hb   = mean(hemoglobin),
+    sd_hb     = sd(hemoglobin),
+    mean_vita = mean(serum_retinol),
+    sd_vita   = sd(serum_retinol),
+    .groups   = "drop"
+  ) |>
+  mutate(across(where(is.numeric) & !n, ~round(., 2))) |>
+  kable(format = "simple",
+        caption = "Inflammation Proxies by Urban/Rural Status")
+```
+
+```{r proxy-correlations}
+# Marginal correlations between proxies and outcome
+hb_data <- uic_data %>% filter(!is.na(hemoglobin))
+sr_data <- uic_data %>% filter(!is.na(serum_retinol))
+
+cat("Hemoglobin correlations:\n")
+cat("  UIC vs Hb:     ", round(cor(hb_data$uic_raw,  hb_data$hemoglobin), 3), "\n")
+cat("  Log(UIC) vs Hb:", round(cor(hb_data$log_uic,  hb_data$hemoglobin), 3), "\n")
+
+cat("\nSerum Retinol correlations:\n")
+cat("  UIC vs SR:     ", round(cor(sr_data$uic_raw,  sr_data$serum_retinol), 3), "\n")
+cat("  Log(UIC) vs SR:", round(cor(sr_data$log_uic,  sr_data$serum_retinol), 3), "\n")
+```
+
+```{r proxy-scatter-plots}
+# Scatter plots: proxies vs log(UIC)
+p17 <- ggplot(hb_data, aes(x = hemoglobin, y = log_uic)) +
+  geom_point(alpha = 0.2, color = "steelblue") +
+  geom_smooth(method = "lm", color = "red", se = TRUE) +
+  labs(title = "Hemoglobin vs Log(UIC)",
+       x = "Hemoglobin (g/dL)", y = "Log(UIC)") +
+  theme_minimal()
+
+p18 <- ggplot(sr_data, aes(x = serum_retinol, y = log_uic)) +
+  geom_point(alpha = 0.2, color = "coral") +
+  geom_smooth(method = "lm", color = "darkred", se = TRUE) +
+  labs(title = "Serum Retinol vs Log(UIC)",
+       x = "Serum Retinol (\u03bcg/dL)", y = "Log(UIC)") +
+  theme_minimal()
+
+print(p17 | p18)
+```
+
+```{r correlation-matrix}
+# Correlation matrix: outcome, proxies, and age
+inflammation_data <- uic_data %>%
+  select(log_uic, hemoglobin, serum_retinol, age) %>%
+  filter(complete.cases(.))
+
+corrplot(cor(inflammation_data),
+         method       = "color",
+         type         = "upper",
+         addCoef.col  = "black",
+         tl.col       = "black",
+         title        = "Correlation Matrix: Outcome and Inflammation Proxies",
+         mar          = c(0, 0, 2, 0))
+```
+
+## 7. Complete-Case Sample Comparison
+
+```{r complete-case-prep}
+# Prepare complete-case dataset (used in DAG testing and downstream stages)
+df_test <- analysis_data |>
+  dplyr::select(log_uic, urban, hemoglobin, serum_retinol,
+         age, sex, education, region) |>
+  dplyr::mutate(
+    sex    = as.numeric(as.factor(sex)),
+    region = as.numeric(as.factor(region)),
+    educ   = as.numeric(education)
+  ) |>
+  na.omit()
+
+cat("Complete-case sample size:", nrow(df_test), "\n")
+```
+
+```{r complete-case-comparison}
+# Compare complete-case sample against full dataset on key variables
+# Checks whether listwise deletion introduces systematic bias
+full_summary <- analysis_data |>
+  summarise(
+    n          = n(),
+    mean_uic   = mean(uic_raw,  na.rm = TRUE),
+    mean_age   = mean(age,      na.rm = TRUE),
+    pct_urban  = mean(urban,    na.rm = TRUE) * 100,
+    pct_female = mean(sex == "Female", na.rm = TRUE) * 100
+  ) |> mutate(sample = "Full dataset")
+
+cc_summary <- df_test |>
+  summarise(
+    n          = n(),
+    mean_uic   = mean(exp(log_uic)),
+    mean_age   = mean(age),
+    pct_urban  = mean(urban) * 100,
+    pct_female = mean(sex == 2) * 100   # Female = level 2 after as.numeric()
+  ) |> mutate(sample = "Complete-case")
+
+bind_rows(full_summary, cc_summary) |>
+  mutate(across(where(is.numeric) & !n, ~round(., 2))) |>
+  select(sample, everything()) |>
+  kable(format = "simple",
+        caption = "Full Dataset vs Complete-Case Sample Comparison")
+```
+
+## 8. DAG Validation
+
+```{r dag-final-define}
+dag_final <- dagitty('dag {
+  urban       -> log_uic
+  urban       -> hemoglobin
+  urban       -> vita
+
+  Z_latent -> log_uic
+  Z_latent -> hemoglobin
+  Z_latent -> vita
+
+  age  -> log_uic
+  age  -> urban
+  age  -> Z_latent
+  age  -> educ
+  age  -> region
+
+  sex  -> log_uic
+  sex  -> Z_latent
+  sex  -> hemoglobin
+  sex  -> educ
+  sex  -> urban
+  sex  -> age
+
+  educ -> urban
+  educ -> log_uic
+  educ -> vita
+  educ -> hemoglobin
+
+  region -> urban
+  region -> log_uic
+  region -> Z_latent
+}')
+
+plot(dag_final)
+```
+
+```{r dag-final-independencies}
+# Implied conditional independencies from dag_final
+impliedConditionalIndependencies(dag_final)
+
+paths(dag_final, from = "urban", to = "log_uic")
+```
+
+```{r dag-local-tests}
+# Local independence testing on 5000-observation complete-case sample
+latents(dag_final) <- "Z_latent"
+
+set.seed(0942)
+df_sample <- df_test |> sample_n(5000)
+
+results_final <- localTests(dag_final,
+                             data = df_sample,
+                             type = "cis",
+                             R    = 200)
+
+results_final |>
+  arrange(desc(abs(estimate))) |>
+  print()
+```
+
+```{r dag-local-test-plot}
+plotLocalTestResults(results_final)
+```
+
+```{r adjustment-sets}
+# Minimally sufficient adjustment sets for causal effect of urban -> log_uic
+adjustmentSets(dag_final,
+               exposure = "urban",
+               outcome  = "log_uic",
+               effect   = "total")
+
+adjustmentSets(dag_final,
+               exposure = "urban",
+               outcome  = "log_uic",
+               effect   = "direct")
+```

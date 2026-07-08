@@ -1,0 +1,331 @@
+---
+title: "Bayesian Latent Confounder Model - Complete Data Preparation"
+author: "Valiao, Syrelle Kaye D."
+date: "2025-11-12"
+output:
+  html_document:
+    self_contained: true
+    code_folding: hide
+    toc: true
+    toc_float: true
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+```{r libraries}
+library(tidyverse)
+library(naniar)
+library(kableExtra)
+library(readr)
+```
+
+
+# Data Loading and Initial Checks
+
+```{r load_data}
+biochem_data <- read_csv("2025-09-05142333_biochemical/2025-09-05142333_data-set_biochemical.csv")
+socio_data   <- read_csv("2025-11-18072406_socio/2025-11-18072406_data-set_socio.csv")
+
+cat("Biochemical data: ",  nrow(biochem_data), "rows ×", ncol(biochem_data), "columns\n")
+cat("Sociodemographic data:", nrow(socio_data),  "rows ×", ncol(socio_data),  "columns\n")
+
+glimpse(biochem_data)
+glimpse(socio_data)
+```
+
+
+# Standardize Keys and Check for Duplicates
+
+```{r standardize_keys}
+pad_member <- function(df) {
+  df %>% mutate(
+    hhnum       = as.character(hhnum),
+    member_code = str_pad(as.character(member_code), width = 2, pad = "0", side = "left")
+  )
+}
+
+biochem_data <- pad_member(biochem_data)
+socio_data   <- pad_member(socio_data)
+
+cat("Biochem unique hhnum-member pairs:", n_distinct(biochem_data %>% select(hhnum, member_code)), "\n")
+cat("Socio  unique hhnum-member pairs:", n_distinct(socio_data  %>% select(hhnum, member_code)), "\n")
+
+# Identify duplicates
+biochem_dupes <- biochem_data %>%
+  group_by(hhnum, member_code) %>% filter(n() > 1) %>% ungroup()
+
+socio_dupes <- socio_data %>%
+  group_by(hhnum, member_code) %>% filter(n() > 1) %>% ungroup()
+
+cat("\nBiochem duplicates:", nrow(biochem_dupes),
+    "| Socio duplicates:", nrow(socio_dupes), "\n")
+
+# Remove duplicates
+if (nrow(biochem_dupes) > 0) {
+  biochem_data <- biochem_data %>% distinct(hhnum, member_code, .keep_all = TRUE)
+  cat("Removed", nrow(biochem_dupes), "duplicate rows from biochem_data\n")
+}
+if (nrow(socio_dupes) > 0) {
+  socio_data <- socio_data %>% distinct(hhnum, member_code, .keep_all = TRUE)
+  cat("Removed", nrow(socio_dupes), "duplicate rows from socio_data\n")
+}
+```
+
+
+# Merge Datasets (LEFT JOIN on Biochem)
+
+```{r merge}
+merged_data <- biochem_data %>%
+  left_join(socio_data, by = c("hhnum", "member_code"), suffix = c("_biochem", "_socio"))
+
+cat("Merged data:", nrow(merged_data), "rows ×", ncol(merged_data), "columns\n")
+cat("Rows retained from biochem:", nrow(merged_data), "of", nrow(biochem_data), "\n")
+
+# Key matching diagnostic
+biochem_keys <- biochem_data %>% select(hhnum, member_code) %>% mutate(in_biochem = TRUE)
+socio_keys   <- socio_data   %>% select(hhnum, member_code) %>% mutate(in_socio   = TRUE)
+key_check    <- full_join(biochem_keys, socio_keys, by = c("hhnum", "member_code"))
+
+cat("\nOnly in biochem (no socio match):", sum(is.na(key_check$in_socio)),   "\n")
+cat("Only in socio  (no biochem match):", sum(is.na(key_check$in_biochem)), "\n")
+cat("In BOTH datasets:                 ", sum(!is.na(key_check$in_biochem) & !is.na(key_check$in_socio)), "\n")
+```
+
+
+# Create Urban Indicator
+
+```{r urban_indicator}
+# NCR: provhuc 83-99; HUCs: specific provhuc codes
+huc_codes <- c(13, 17, 23, 29, 40, 42, 46, 47, 49, 53,
+               60, 67, 69, 72, 79, 82, 101, 111)
+
+merged_data <- merged_data %>%
+  mutate(
+    urban_indicator = case_when(
+      provhuc_socio >= 83 & provhuc_socio <= 99 ~ 1,  # NCR
+      provhuc_socio %in% huc_codes               ~ 1,  # HUCs
+      !is.na(provhuc_socio)                      ~ 0,  # Rural
+      TRUE                                       ~ NA_real_
+    ),
+    norm_wgt = fwgti_natl2_var / mean(fwgti_natl2_var, na.rm = TRUE)
+  )
+
+cat("Urban indicator distribution:\n")
+print(table(merged_data$urban_indicator, useNA = "ifany"))
+```
+
+
+# Create Analysis Dataset
+
+```{r analysis_dataset}
+analysis_data <- merged_data %>%
+  rename_with(tolower) %>%
+  mutate(
+    # --- Outcomes ---
+    uic_raw = as.numeric(uic),
+    log_uic = ifelse(!is.na(uic_raw) & uic_raw > 0, log(uic_raw), NA_real_),
+
+    # --- Exposure ---
+    # NOTE: named `urban` throughout; urban_indicator is the intermediate variable
+    urban = as.numeric(urban_indicator),
+
+    # --- Measured Confounders ---
+    age       = as.numeric(age),
+    sex       = factor(case_when(sex == 1 ~ "Male", sex == 2 ~ "Female",
+                                 TRUE ~ NA_character_),
+                       levels = c("Male", "Female")),
+    education  = as.numeric(educ),
+    occupation = factor(occup),
+    has_work   = factor(haswork),
+
+    # --- Inflammation Proxies ---
+    hemoglobin    = as.numeric(hemoglobin),
+    serum_retinol = as.numeric(vita),   # vita = serum retinol in µg/dL
+
+    # --- Spatial Identifiers ---
+    province_code   = as.numeric(provhuc_socio),
+    region          = factor(regcode_socio),    # used as `region` in EDA
+    rep_prov        = as.character(rep_prov_socio),
+    regcode_biochem = as.character(regcode_biochem),
+    residential_hc  = as.character(rhc),
+
+    # --- Survey Design ---
+    psu        = as.character(psc),
+    ms_psucode = as.character(ms_psucode_socio),
+    weight     = as.numeric(norm_wgt),
+    fwgti_prov = as.numeric(fwgti_prov),
+
+    # --- Time ---
+    survey_year = as.numeric(enns_year_socio),
+
+    # --- Additional ---
+    civil_status = as.character(csc),
+    workplace    = as.character(wrkplace)
+  ) %>%
+  select(
+    hhnum, member_code,
+    uic_raw, log_uic,
+    urban,
+    age, sex, education,
+    occupation, has_work, civil_status,
+    hemoglobin, serum_retinol,
+    province_code, region, rep_prov, 
+    regcode_biochem, residential_hc,
+    psu, ms_psucode, weight, fwgti_prov,
+    survey_year, workplace
+  )
+
+cat("Final analysis data:", nrow(analysis_data), "rows ×", ncol(analysis_data), "columns\n")
+```
+
+# Document Missingness
+
+```{r missingness}
+# Overall missingness table
+missing_summary <- analysis_data %>%
+  summarise(across(everything(), ~sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "missing_count") %>%
+  mutate(
+    missing_percent = round(missing_count / nrow(analysis_data) * 100, 2),
+    present_count   = nrow(analysis_data) - missing_count,
+    present_percent = round(100 - missing_percent, 2)
+  ) %>%
+  arrange(desc(missing_count))
+
+missing_summary %>%
+  kable(format = "simple", caption = "Missing Data Summary")
+
+# Missingness by variable type
+var_groups <- list(
+  "Outcome Variables"   = c("uic_raw", "log_uic"),
+  "Exposure Variable"   = c("urban"),
+  "Measured Confounders" = c("age", "sex", "household_size", "education",
+                              "wealth_quintile", "occupation"),
+  "Inflammation Proxies" = c("hemoglobin", "serum_retinol",
+                              "fever_recent", "diarrhea_recent"),
+  "Spatial Identifiers"  = c("province_code", "region"),
+  "Survey Design"        = c("psu", "strata", "weight", "survey_year")
+)
+
+for (type in names(var_groups)) {
+  cat("\n", type, ":\n", sep = "")
+  missing_summary %>%
+    filter(variable %in% var_groups[[type]]) %>%
+    select(variable, missing_count, missing_percent) %>%
+    print()
+}
+
+# Missingness patterns
+cat("\nComplete cases:\n")
+cat("  With UIC:              ", sum(!is.na(analysis_data$uic_raw)), "\n")
+cat("  With urban:            ", sum(!is.na(analysis_data$urban)),   "\n")
+cat("  With UIC + urban:      ",
+    sum(!is.na(analysis_data$uic_raw) & !is.na(analysis_data$urban)), "\n")
+cat("  All variables complete:", sum(complete.cases(analysis_data)), "\n")
+
+# Visualize missingness (downsampled for speed)
+set.seed(0942)
+analysis_sample <- analysis_data %>% slice_sample(n = 5000)
+
+gg_miss_upset(analysis_sample %>% select(-hhnum, -member_code),
+              nsets = 10, nintersects = 20)
+
+vis_miss(analysis_sample %>% select(-hhnum, -member_code), cluster = TRUE) +
+  labs(title = "Missingness Pattern (Sample of 5,000 rows)")
+
+library(knitr)
+library(kableExtra)
+
+missing_summary %>%
+  rename(
+    "Variable"         = variable,
+    "Missing (n)"      = missing_count,
+    "Missing (%)"      = missing_percent,
+    "Present (n)"      = present_count,
+    "Present (%)"      = present_percent
+  ) %>%
+  kable(
+    format    = "latex",
+    booktabs  = TRUE,
+    caption   = "Missing Data Summary",
+    label     = "tab:missingness",
+    align     = c("l", "r", "r", "r", "r")
+  ) %>%
+  kable_styling(
+    latex_options = c("hold_position", "striped")
+  ) %>%
+  writeLines("missingness_table.tex")
+```
+
+
+# Descriptive Statistics
+
+```{r descriptive_stats}
+# Continuous variables
+# BUG FIX: `names_sep = "_"` breaks multi-word variable names (e.g. uic_raw, log_uic).
+# Use `names_pattern` to split only on the LAST underscore.
+continuous_vars <- c("uic_raw", "log_uic", "age", "hemoglobin", "serum_retinol", "weight")
+
+analysis_data %>%
+  select(all_of(continuous_vars)) %>%
+  summarise(across(everything(), list(
+    n      = ~sum(!is.na(.)),
+    mean   = ~mean(., na.rm = TRUE),
+    sd     = ~sd(., na.rm = TRUE),
+    median = ~median(., na.rm = TRUE),
+    q25    = ~quantile(., 0.25, na.rm = TRUE),
+    q75    = ~quantile(., 0.75, na.rm = TRUE),
+    min    = ~min(., na.rm = TRUE),
+    max    = ~max(., na.rm = TRUE)
+  ))) %>%
+  pivot_longer(everything(),
+               names_to      = c("variable", "statistic"),
+               names_pattern = "^(.+)_([^_]+)$",
+               values_to     = "value") %>%
+  pivot_wider(names_from = statistic, values_from = value) %>%
+  mutate(across(where(is.numeric) & !n, ~round(., 2))) %>%
+  kable(format = "simple", caption = "Descriptive Statistics - Continuous Variables")
+
+# Categorical distributions
+cat("\nUrban/Rural:\n"); print(table(analysis_data$urban,       useNA = "ifany"))
+cat("\nSex:\n");         print(table(analysis_data$sex,         useNA = "ifany"))
+cat("\nSurvey Year:\n"); print(table(analysis_data$survey_year, useNA = "ifany"))
+```
+
+
+# Save Outputs
+
+```{r save}
+# Single output file — loaded directly by EDA
+write_csv(analysis_data, "analysis_data_final.csv")
+
+cat("File saved: analysis_data_final.csv (", nrow(analysis_data), "rows ×",
+    ncol(analysis_data), "columns)\n")
+```
+
+
+# Summary Report
+
+```{r summary}
+pct <- function(x, n) round(sum(!is.na(x)) / n * 100, 1)
+n   <- nrow(analysis_data)
+
+cat("SAMPLE SIZE:\n")
+cat("  Original biochem records:", nrow(biochem_data), "\n")
+cat("  Final analysis dataset:  ", n, "\n")
+cat("  Records retained:        ", round(n / nrow(biochem_data) * 100, 1), "%\n\n")
+
+cat("KEY VARIABLES STATUS:\n")
+cat("  Outcome (UIC):    ", sum(!is.na(analysis_data$uic_raw)),      "complete (", pct(analysis_data$uic_raw,      n), "%)\n")
+cat("  Exposure (urban): ", sum(!is.na(analysis_data$urban)),        "complete (", pct(analysis_data$urban,        n), "%)\n")
+cat("  Age:              ", sum(!is.na(analysis_data$age)),          "complete (", pct(analysis_data$age,          n), "%)\n")
+cat("  Sex:              ", sum(!is.na(analysis_data$sex)),          "complete (", pct(analysis_data$sex,          n), "%)\n")
+cat("  Hemoglobin:       ", sum(!is.na(analysis_data$hemoglobin)),   "complete (", pct(analysis_data$hemoglobin,   n), "%)\n")
+cat("  Serum Retinol:    ", sum(!is.na(analysis_data$serum_retinol)),"complete (", pct(analysis_data$serum_retinol,n), "%)\n")
+
+cat("\nREADY FOR BAYESIAN LATENT CONFOUNDER ANALYSIS\n")
+```
+

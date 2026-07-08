@@ -1,0 +1,1157 @@
+---
+title: "Stage 2 — Bayesian Hierarchical Model (INLA)"
+author: "Valiao, Syrelle Kaye D."
+date: "2026-01-29"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    fig_caption: true
+    fig_width: 10
+    fig_height: 6
+    keep_tex: false
+fontsize: 11pt
+geometry: margin=1in
+header-includes:
+  - \usepackage{amsmath}
+  - \usepackage{amssymb}
+  - \usepackage{graphicx}
+  - \usepackage{float}
+  - \usepackage{booktabs}
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE, eval = TRUE,
+                      fig.pos = "H")
+
+# ── RERUN CONTROL ────────────────────────────────────────
+RERUN_INLA_MODELS <- FALSE     # Change to TRUE if you modify model specs
+RERUN_BYM <- FALSE             # Change to TRUE if you modify BYM architecture
+# ───────────────────────────────────────────────────────────
+
+# Load CEVAE outputs first (prerequisite)
+cevae_workspace <- "~/thesis_char/Thesis/cevae_workspace.RData"
+inla_workspace <- "~/thesis_char/Thesis/inla_workspace.RData"
+
+if (file.exists(cevae_workspace)) {
+  load(cevae_workspace)
+  cat("✓ CEVAE workspace loaded\n")
+}
+
+# Then load existing INLA results if available
+if (file.exists(inla_workspace) && !RERUN_INLA_MODELS && !RERUN_BYM) {
+  load(inla_workspace)
+  cat("✓ INLA workspace loaded (RERUN flags = FALSE)\n")
+}
+
+set.seed(0942)
+```
+
+```{r inla-models, eval = RERUN_INLA_MODELS, cache=FALSE}
+library(INLA)
+library(tidyverse)
+set.seed(0942)
+
+inla.setOption(num.threads = 10)
+inla.setOption(smtp = "taucs")
+
+inla_input <- readRDS("cevae_inla_input.RDS")
+
+# Spatial precision prior (PC prior) 
+# P(sigma > 1) = 0.01: 99% confident spatial SD < 1 log-UIC unit
+pc_prior_spatial <- list(
+  prec = list(prior = "pc.prec", param = c(1, 0.01))
+)
+
+prepare_dat <- function(dat_m) {
+  
+  active_cols <- c("z_mean_1", "z_mean_7", "z_mean_10")
+  all_z_cols   <- paste0("z_mean_", 1:10)
+  
+  dat_m %>%
+    mutate(
+      # Treatment: numeric 0/1
+      urban_bin     = as.numeric(urban == "Urban"),
+      
+      # z_std: active dims (1, 7, 10) row-mean, then standardized — M1
+      z_active_mean = rowMeans(across(all_of(active_cols))),
+      z_std         = as.numeric(scale(z_active_mean)),
+      
+      # z_std_full: all 10 dims row-mean, then standardized — M2 sensitivity
+      z_all_mean    = rowMeans(across(all_of(all_z_cols))),
+      z_std_full    = as.numeric(scale(z_all_mean)),
+      
+      # Covariates
+      age_std       = as.numeric(scale(age)),
+      sex_bin       = as.numeric(sex == "Female"),
+      educ_std      = as.numeric(scale(as.numeric(as.character(education)))),
+      year_fact     = factor(survey_year),
+      
+      # Spatial ID: province first, fallback to region
+      prov_id       = as.integer(factor(province_code)),
+      region_id     = as.integer(factor(region)),
+      spatial_id    = if (all(is.na(prov_id))) region_id else prov_id
+    )
+}
+
+# M1: Main CEVAE-adjusted model (active latent dims 4, 7, 9)
+formula_m1 <- log_uic ~
+  urban_bin + z_std +
+  age_std + sex_bin + educ_std + year_fact +
+  f(spatial_id, model = "iid", hyper = pc_prior_spatial)
+
+# M2: Sensitivity — all 10 latent dims
+formula_m2 <- log_uic ~
+  urban_bin + z_std_full +
+  age_std + sex_bin + educ_std + year_fact +
+  f(spatial_id, model = "iid", hyper = pc_prior_spatial)
+
+# M3: Naive baseline — no latent z
+formula_m3 <- log_uic ~
+  urban_bin +
+  age_std + sex_bin + educ_std + year_fact +
+  f(spatial_id, model = "iid", hyper = pc_prior_spatial)
+
+formulas <- list(M1 = formula_m1, M2 = formula_m2, M3 = formula_m3)
+
+# Fit all models across all imputations 
+inla_fits <- list()
+
+# ── CONFOUNDING ADJUSTMENT (Independent of Survey Weights) ─
+# Model includes:
+#   • weights = survey design correction
+#   • z_std = latent confounding proxy (CEVAE)
+#   • age_std, sex_bin, educ_std, year_fact = measured confounders
+# These are NOT redundant; weights address sampling design,
+# confounders address causal confounding.
+# ─────────────────────────────────────────────────────────────
+
+# ── SURVEY WEIGHTING ────────────────────────────────────────
+# weights = fwgti_natl2_var / mean(fwgti_natl2_var, na.rm=TRUE)
+# Source: ENNS 2018-2019 National sampling weights
+# Purpose: Correct for differential sampling probability by region/strata
+# Note: These are NOT confounding-related weights (not propensity weights)
+# ─────────────────────────────────────────────────────────────
+
+for (mod_name in names(formulas)) {
+  
+  cat(sprintf("Fitting model %s\n", mod_name))
+
+  inla_fits[[mod_name]] <- vector("list", 5)
+  
+  for (m in 1:5) {
+    cat(sprintf("  Imputation %d/5...", m))
+    
+    dat_m <- inla_input %>%
+      filter(imputation_id == m) %>%
+      prepare_dat()
+    
+    inla_fits[[mod_name]][[m]] <- inla(
+      formulas[[mod_name]],
+      family            = "gaussian",
+      data              = dat_m,
+      weights           = dat_m$weight,
+      control.compute   = list(
+        dic              = TRUE,
+        waic             = TRUE,
+        config           = TRUE,
+        return.marginals = TRUE
+      ),
+      control.predictor = list(compute = TRUE)
+    )
+    
+    cat(sprintf(" DIC = %.2f | WAIC = %.2f\n",
+                inla_fits[[mod_name]][[m]]$dic$dic,
+                inla_fits[[mod_name]][[m]]$waic$waic))
+  }
+}
+
+# MATE extraction + Rubin's Rules
+pool_mate <- function(fits, coef_name = "urban_bin", n_obs) {
+  
+  # Verify coefficient name exists
+  fixed_names <- rownames(fits[[1]]$summary.fixed)
+  if (!coef_name %in% fixed_names) {
+    stop(sprintf(
+      "'%s' not found in summary.fixed. Available: %s",
+      coef_name, paste(fixed_names, collapse = ", ")
+    ))
+  }
+  
+  # Extract per-imputation estimates
+  mate_tbl <- lapply(1:5, function(m) {
+    row <- fits[[m]]$summary.fixed[coef_name, ]
+    data.frame(
+      imputation_id = m,
+      Q  = row$mean,
+      U  = row$sd^2,
+      lo = row$`0.025quant`,
+      hi = row$`0.975quant`
+    )
+  }) %>% bind_rows()
+  
+  # Rubin's Rules
+  M       <- 5
+  Q_bar   <- mean(mate_tbl$Q)
+  U_bar   <- mean(mate_tbl$U)
+  B       <- var(mate_tbl$Q)
+  T_var   <- U_bar + (1 + 1/M) * B
+  SE_pool <- sqrt(T_var)
+  lambda  <- (1 + 1/M) * B / T_var
+  
+  # Degrees of freedom (Barnard & Rubin 1999)
+  n_par  <- nrow(fits[[1]]$summary.fixed)
+  df_old <- (M - 1) / lambda^2
+  df_obs <- (n_obs - n_par) * (1 - lambda)
+  df_adj <- (df_old * df_obs) / (df_old + df_obs)
+  t_crit <- qt(0.975, df = df_adj)
+  
+  data.frame(
+    MATE         = round(Q_bar, 4),
+    SE           = round(SE_pool, 4),
+    CI_low       = round(Q_bar - t_crit * SE_pool, 4),
+    CI_high      = round(Q_bar + t_crit * SE_pool, 4),
+    MATE_exp     = round(exp(Q_bar), 4),
+    df           = round(df_adj, 1),
+    lambda       = round(lambda, 4),
+    per_imp_ests = paste(round(mate_tbl$Q, 4), collapse = ", ")
+  )
+}
+
+# Get n_obs from the prepared data (same for all imputations)
+n_obs_per_imp <- inla_input %>%
+  filter(imputation_id == 1) %>%
+  prepare_dat() %>%
+  nrow()
+
+cat(sprintf("n_obs per imputation: %d\n", n_obs_per_imp))
+
+# Pool across models
+mate_results <- lapply(names(inla_fits), function(mod_name) {
+  
+  cat(sprintf("\nPooling MATE for %s...\n", mod_name))
+  res       <- pool_mate(inla_fits[[mod_name]], 
+                         coef_name = "urban_bin",
+                         n_obs     = n_obs_per_imp)
+  res$model <- mod_name
+  res
+  
+}) %>% bind_rows() %>%
+  select(model, MATE, SE, CI_low, CI_high, MATE_exp, lambda, df, per_imp_ests)
+
+# Model fit comparison
+fit_comparison <- lapply(names(inla_fits), function(mod_name) {
+  
+  dic_vals  <- sapply(1:5, function(m) inla_fits[[mod_name]][[m]]$dic$dic)
+  waic_vals <- sapply(1:5, function(m) inla_fits[[mod_name]][[m]]$waic$waic)
+  
+  data.frame(
+    model    = mod_name,
+    DIC_mean = round(mean(dic_vals),  2),
+    DIC_sd   = round(sd(dic_vals),    2),
+    WAIC_mean = round(mean(waic_vals), 2),
+    WAIC_sd   = round(sd(waic_vals),   2)
+  )
+}) %>% bind_rows()
+
+cat("MATE Comparison Across Models (Rubin's Rules)\n")
+print(mate_results)
+
+cat("Model Fit: Mean DIC and WAIC Across Imputations\n")
+print(fit_comparison)
+
+cat("\nInterpretation guide:\n")
+for (i in 1:nrow(mate_results)) {
+  cat(sprintf(
+    "  %s: Urban vs Rural MATE = %.4f (95%% CI: %.4f, %.4f) | exp = %.3f | lambda = %.4f\n",
+    mate_results$model[i],
+    mate_results$MATE[i],
+    mate_results$CI_low[i],
+    mate_results$CI_high[i],
+    mate_results$MATE_exp[i],
+    mate_results$lambda[i]
+  ))
+}
+
+saveRDS(inla_fits,     "inla_fits_all.RDS")
+saveRDS(mate_results,  "mate_results.RDS")
+write.csv(mate_results,   "mate_results_all_models.csv",  row.names = FALSE)
+write.csv(fit_comparison, "inla_fit_comparison.csv",      row.names = FALSE)
+
+cat("\n All INLA outputs saved.\n")
+```
+
+```{r visualization, cache=FALSE}
+library(tidyverse)
+library(patchwork)
+
+col_m1 <- "#3c0f5b"
+col_m2 <- "#4a7a10"
+col_m3 <- "#87067F"
+cols   <- c(M1 = col_m1, M2 = col_m2, M3 = col_m3)
+
+model_labels <- c(
+  M1 = "M1: CEVAE-adjusted\n(Active dims 1, 7, 10)",
+  M2 = "M2: CEVAE-adjusted\n(All 10 dims)",
+  M3 = "M3: Naive baseline\n(No latent z)"
+)
+
+plot_df <- mate_results |>
+  mutate(
+    model       = factor(model, levels = c("M3", "M2", "M1")),
+    model_label = factor(model_labels[as.character(model)],
+                         levels = rev(model_labels))
+  )
+
+per_imp_df <- mate_results |>
+  select(model, per_imp_ests) |>
+  mutate(imp = strsplit(per_imp_ests, ", ")) |>
+  unnest(imp) |>
+  mutate(
+    imp_num     = rep(1:5, times = nrow(mate_results)),
+    imp_val     = as.numeric(imp),
+    model       = factor(model, levels = c("M3", "M2", "M1")),
+    model_label = factor(model_labels[as.character(model)],
+                         levels = rev(model_labels))
+  )
+
+fit_df <- fit_comparison |>
+  mutate(
+    model       = factor(model, levels = c("M3", "M2", "M1")),
+    model_label = factor(model_labels[as.character(model)],
+                         levels = rev(model_labels)),
+    label_dic   = sprintf("%.1f (\u00b1%.1f)", DIC_mean,  DIC_sd),
+    label_waic  = sprintf("%.1f (\u00b1%.1f)", WAIC_mean, WAIC_sd)
+  )
+
+metrics_df <- fit_df |>
+  left_join(plot_df |> select(model, lambda, df), by = "model")
+
+p_forest <- ggplot(plot_df,
+                   aes(x = MATE, y = model_label, color = model)) +
+
+  geom_vline(xintercept = 0, linetype = "dashed",
+             color = "grey50", linewidth = 0.5) +
+
+  geom_point(data = per_imp_df,
+             aes(x = imp_val, y = model_label, color = model),
+             shape = 1, size = 3, alpha = 0.5,
+             position = position_nudge(y = 0.18)) +
+
+  geom_linerange(aes(xmin = CI_low, xmax = CI_high),
+                 linewidth = 1.4, alpha = 0.85) +
+
+  geom_point(size = 5, shape = 18) +
+
+  geom_text(aes(x = 0.36, 
+                label = sprintf("%.4f (%.4f, %.4f)\nexp = %.3f",
+                                MATE, CI_low, CI_high, MATE_exp)),
+            hjust      = 0,
+            size       = 4.5, 
+            color      = "grey20",
+            lineheight = 0.9) + 
+
+  scale_color_manual(values = cols) +
+  scale_x_continuous(
+    limits = c(-0.02, 0.55), 
+    breaks = seq(0, 0.5, 0.1),
+    expand = c(0, 0)
+  ) +
+  coord_cartesian(clip = "off", ylim = c(0.6, 3.8)) +
+  labs(
+    title    = "MATE of Urban vs Rural Residence on log(UIC)",
+    subtitle = "Pooled across 5 imputations via Rubin's Rules | Open circles = per-imputation estimates",
+    x        = "Marginal Average Treatment Effect (log scale)",
+    y        = NULL
+  ) +
+  theme_minimal(base_size = 15) + 
+  theme(
+    plot.title         = element_text(face = "bold", size = 16),
+    plot.subtitle      = element_text(size = 11, color = "grey40"),
+    legend.position    = "none",
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor   = element_blank(),
+    axis.text.y        = element_text(size = 13, lineheight = 1.1),
+    plot.margin        = margin(10, 5, 30, 10) 
+  )
+
+col_positions <- c(0.25, 0.55, 0.78, 0.93)
+
+p_metrics <- ggplot(metrics_df, aes(y = model_label)) +
+  # Raise headers slightly higher
+  annotate("text", x = col_positions, y = 3.8,
+           label = c("DIC", "WAIC", "\u03bb", "df"),
+           size = 5.5, fontface = "bold", color = "grey20", hjust = 0.5) +
+
+  # Raise divider line to match
+  annotate("segment", x = 0.10, xend = 1.10, y = Inf, yend = Inf,
+           color = "grey70", linewidth = 0.3) +
+
+  # Values stay lower, so there’s space
+  geom_text(aes(x = col_positions[1], label = label_dic, color = model),
+            size = 4.5, hjust = 0.5, fontface = "bold") +
+  geom_text(aes(x = col_positions[2], label = label_waic, color = model),
+            size = 4.5, hjust = 0.5, fontface = "bold") +
+  geom_text(aes(x = col_positions[3], color = model,
+                label = sprintf("%.4f", lambda)),
+            size = 4.5, hjust = 0.5, fontface = "bold") +
+  geom_text(aes(x = col_positions[4], color = model,
+                label = sprintf("%.0f", df)),
+            size = 4.5, hjust = 0.5, fontface = "bold") +
+
+  # Model labels on the left
+  geom_text(aes(x = 0.03, label = as.character(model), color = model),
+            size = 4.5, hjust = 0.5, fontface = "bold") +
+
+  scale_color_manual(values = cols,
+                     labels = model_labels,
+                     name = "Model") +
+  scale_x_continuous(limits = c(0, 1)) +
+  scale_y_discrete(drop = FALSE) +
+  coord_cartesian(clip = "off", ylim = c(0.6, 3.55)) +
+  labs(
+    title    = "Model fit & imputation diagnostics",
+    subtitle = "Mean (\u00b1SD) across 5 imputations | \u03bb = variance from missingness",
+    x = NULL, y = NULL
+  ) +
+  theme_minimal(base_size = 15) +
+  theme(
+    plot.title      = element_text(face = "bold", size = 16, hjust = 0.5),
+    plot.subtitle   = element_text(size = 11, color = "grey40", hjust = 0.5),
+    plot.title.position = "plot",
+    legend.position = "none",
+    panel.grid      = element_blank(),
+    axis.text.x     = element_blank(),
+    axis.text.y     = element_blank(),
+    axis.ticks      = element_blank(),
+    plot.margin     = margin(10, 5, 10, 5)
+  )
+
+ggsave("mate_forest.pdf", p_forest, width = 10, height = 5.5, device = cairo_pdf)
+
+ggsave("mate_metrics.pdf", p_metrics, width = 7, height = 4, device = cairo_pdf)
+```
+
+
+### BYM
+
+```{r bym-crosswalk, eval = RERUN_BYM, cache=FALSE}
+library(sf)
+library(spdep)
+library(INLA)
+library(tidyverse)
+library(patchwork)
+
+# ── 1. Load shapefile ──────────────────────────────────────────────────────────
+shp <- st_read(
+  "phl_adm_psa_namria_20231106_shp",
+  layer = "phl_admbnda_adm2_psa_namria_20231106"
+)
+
+# ── 2. Corrected crosswalk from official ENNS codebook ─────────────────────────
+crosswalk <- tribble(
+  ~province_code, ~ADM2_PCODE,
+  # Region I
+  1,  "PH01028",   # Ilocos Norte
+  2,  "PH01029",   # Ilocos Sur
+  4,  "PH01055",   # Pangasinan
+  # Region II
+  5,  "PH02009",   # Batanes
+  6,  "PH02015",   # Cagayan Province
+  7,  "PH02031",   # Isabela Province
+  8,  "PH02050",   # Nueva Vizcaya
+  9,  "PH02057",   # Quirino
+  # Region III (13=Angeles City, 17=Olongapo City are HUCs)
+  10, "PH03008",   # Bataan       ← codebook: 10 = Bataan
+  11, "PH03014",   # Bulacan      ← codebook: 11 = Bulacan
+  12, "PH03049",   # Nueva Ecija  ← codebook: 12 = Nueva Ecija
+  13, NA,          # Angeles City (HUC)
+  14, "PH03054",   # Pampanga
+  15, "PH03069",   # Tarlac
+  16, "PH03071",   # Zambales
+  17, NA,          # Olongapo City (HUC)
+  18, "PH03077",   # Aurora
+  # Region IV-A (codebook: 21=Laguna, 22=Quezon, 24=Rizal)
+  21, "PH04034",   # Laguna
+  22, "PH04056",   # Quezon Province
+  24, "PH04058",   # Rizal
+  # Region IV-B/MIMAROPA
+  25, "PH17040",   # Marinduque
+  27, "PH17052",   # Oriental Mindoro
+  28, "PH17053",   # Palawan
+  30, "PH17059",   # Romblon
+  # Region V
+  31, "PH05005",   # Albay
+  32, "PH05016",   # Camarines Norte
+  33, "PH05017",   # Camarines Sur
+  34, "PH05020",   # Catanduanes
+  35, "PH05041",   # Masbate
+  36, "PH05062",   # Sorsogon
+  # Region VI (40=Iloilo City HUC)
+  37, "PH06004",   # Aklan
+  38, "PH06006",   # Antique
+  39, "PH06019",   # Capiz
+  40, NA,          # Iloilo City (HUC)
+  41, "PH06030",   # Iloilo Province
+  44, "PH06079",   # Guimaras     ← codebook: 44 = Guimaras
+  # Region VII (46=Mandaue, 47=Lapu-Lapu, 49=Cebu City are HUCs)
+  45, "PH07012",   # Bohol
+  46, NA,          # Mandaue City (HUC)
+  47, NA,          # Lapu-Lapu City (HUC)
+  48, "PH07022",   # Cebu Province ← codebook: 48 = Cebu
+  49, NA,          # Cebu City (HUC)
+  50, "PH07046",   # Negros Oriental
+  51, "PH07061",   # Siquijor
+  # Region VIII (53=Tacloban HUC)
+  52, "PH08026",   # Eastern Samar
+  53, NA,          # Tacloban City (HUC)
+  54, "PH08037",   # Leyte
+  55, "PH08048",   # Northern Samar
+  56, "PH08060",   # Western Samar
+  57, "PH08064",   # Southern Leyte
+  58, "PH08078",   # Biliran
+  # Region IX (60=Zamboanga City, 63=City of Isabela are HUCs)
+  59, "PH09072",   # Zamboanga del Norte
+  60, NA,          # Zamboanga City (HUC)
+  61, "PH09073",   # Zamboanga del Sur
+  62, "PH09083",   # Zamboanga Sibugay
+  63, NA,          # City of Isabela (HUC)
+  # Region X (65=Camiguin, 67=Iligan, 69=CDO are codebook codes)
+  64, "PH10013",   # Bukidnon
+  65, "PH10018",   # Camiguin     ← codebook: 65 = Camiguin
+  66, "PH10035",   # Lanao del Norte
+  67, NA,          # Iligan City (HUC)
+  68, "PH10042",   # Misamis Occidental
+  69, NA,          # Cagayan de Oro (HUC) ← codebook: 69 = CDO
+  70, "PH10043",   # Misamis Oriental
+  # Region XI (72=Davao City HUC)
+  71, "PH11023",   # Davao del Norte
+  72, NA,          # Davao City (HUC)
+  74, "PH11025",   # Davao Oriental
+  75, "PH11082",   # Davao de Oro (Compostela Valley)
+  76, "PH11086",   # Davao Occidental
+  # Region XII (79=GenSan, 82=Cotabato City are HUCs)
+  77, "PH12047",   # North Cotabato
+  78, "PH12063",   # South Cotabato
+  79, NA,          # General Santos City (HUC)
+  80, "PH12065",   # Sultan Kudarat
+  81, "PH12080",   # Sarangani
+  82, NA,          # Cotabato City (HUC)
+  # NCR (codebook: 83=Manila, 84=Mandaluyong, ..., 99=Pasay)
+  83, "PH13039",   # City of Manila
+  84, "PH13074",   # Mandaluyong City
+  85, "PH13074",   # San Juan City     → map to 2nd District
+  86, "PH13074",   # Quezon City       → map to 2nd District
+  87, "PH13074",   # City of Marikina  → map to 2nd District
+  88, "PH13074",   # City of Pasig     → map to 2nd District
+  89, "PH13075",   # Caloocan City     → map to 3rd District
+  90, "PH13075",   # City of Malabon   → map to 3rd District
+  91, "PH13075",   # City of Navotas   → map to 3rd District
+  92, "PH13075",   # City of Valenzuela→ map to 3rd District
+  93, "PH13076",   # Makati City       → map to 4th District
+  94, "PH13076",   # Taguig City       → map to 4th District
+  95, "PH13076",   # Las Piñas City    → map to 4th District
+  96, "PH13076",   # City of Parañaque → map to 4th District
+  97, "PH13076",   # Pateros           → map to 4th District
+  98, "PH13076",   # City of Muntinlupa→ map to 4th District
+  99, "PH13076",   # Pasay City        → map to 4th District
+  # CAR (101=Baguio City HUC)
+  100, "PH14001",  # Abra
+  101, NA,         # Baguio City (HUC)
+  102, "PH14011",  # Benguet
+  104, "PH14032",  # Kalinga
+  105, "PH14033",  # Mountain Province
+  # BARMM
+  107, "PH19007",  # Basilan
+  108, "PH19036",  # Lanao del Sur
+  109, "PH19044",  # Maguindanao  ← codebook: 109 = Maguindanao (not Sulu)
+  # Caraga (111=Butuan City HUC)
+  111, NA,         # Butuan City (HUC)
+  112, "PH16002",  # Agusan del Norte
+  113, "PH16003",  # Agusan del Sur
+  114, "PH16067",  # Surigao del Norte
+  115, "PH16068",  # Surigao del Sur
+  116, "PH16085"   # Dinagat Islands
+)
+```
+
+
+```{r bym-spatialre, eval = RERUN_BYM, cache=FALSE}
+set.seed(0942)
+# ── 3. Build spatial random effects from existing M1 fits ──────────────────────
+inla_fits  <- readRDS("inla_fits_all.RDS")
+inla_input <- readRDS("cevae_inla_input.RDS")
+
+spatial_re <- lapply(1:5, function(m) {
+  inla_fits[["M1"]][[m]]$summary.random$spatial_id %>%
+    select(ID, mean) %>%
+    rename(spatial_id = ID, re_mean = mean) %>%
+    mutate(imputation = m)
+}) %>%
+  bind_rows() %>%
+  group_by(spatial_id) %>%
+  summarise(re_pooled = mean(re_mean), .groups = "drop")
+
+# Province lookup: integer spatial_id → province_code
+prov_lookup <- inla_input %>%
+  filter(imputation_id == 1) %>%
+  distinct(province_code) %>%
+  arrange(province_code) %>%
+  mutate(spatial_id = row_number())
+
+# ── 4. Join RE to shapefile via crosswalk ──────────────────────────────────────
+re_by_pcode <- prov_lookup %>%
+  left_join(crosswalk, by = "province_code") %>%
+  left_join(spatial_re, by = "spatial_id") %>%
+  filter(!is.na(ADM2_PCODE)) %>%
+  group_by(ADM2_PCODE) %>%
+  summarise(re_pooled = mean(re_pooled, na.rm = TRUE), .groups = "drop")
+
+cat("Provinces matched:", nrow(re_by_pcode), "\n")
+cat("No duplicates:", n_distinct(re_by_pcode$ADM2_PCODE) == nrow(re_by_pcode), "\n")
+
+map_df_iid <- shp %>%
+  left_join(re_by_pcode, by = "ADM2_PCODE")
+
+# ── 5. Build adjacency graph for BYM2 ─────────────────────────────────────────
+nb    <- poly2nb(map_df_iid, row.names = map_df_iid$ADM2_PCODE)
+mat   <- nb2mat(nb, style = "B", zero.policy = TRUE)
+graph <- inla.read.graph(mat)
+
+# ── 6. Align spatial_id to graph node order ───────────────────────────────────
+
+# Shapefile row order IS the graph node order
+shp_order <- map_df_iid %>%
+  st_drop_geometry() %>%
+  select(ADM2_PCODE) %>%
+  mutate(graph_node = row_number())
+
+# Link graph nodes to province_code via crosswalk
+node_lookup <- crosswalk %>%
+  filter(!is.na(ADM2_PCODE)) %>%
+  left_join(shp_order, by = "ADM2_PCODE") %>%
+  filter(!is.na(graph_node)) %>%
+  select(province_code, graph_node)
+
+cat("Province codes matched to graph nodes:", nrow(node_lookup), "\n")
+
+# Valid province codes — only those with a graph node
+valid_province_codes <- node_lookup$province_code
+
+# Report what gets dropped
+dropped_codes <- inla_input %>%
+  filter(imputation_id == 1) %>%
+  distinct(province_code) %>%
+  filter(!province_code %in% valid_province_codes)
+
+cat("\nProvince codes dropped from BYM2 (HUCs or unmatched):\n")
+print(dropped_codes)
+
+# Observation-level drop summary
+drop_summary <- inla_input %>%
+  filter(imputation_id == 1) %>%
+  summarise(
+    total       = n(),
+    dropped     = sum(!province_code %in% valid_province_codes),
+    kept        = sum(province_code %in% valid_province_codes),
+    pct_dropped = round(100 * mean(!province_code %in% valid_province_codes), 2)
+  )
+cat("\nObservation drop summary (imputation 1):\n")
+print(drop_summary)
+
+# ── 7. Data preparation functions ─────────────────────────────────────────────
+
+# IID: keeps all observations, uses factor-based spatial_id
+prepare_dat_iid <- function(dat_m) {
+  dat_m %>%
+    mutate(
+      urban_bin     = as.numeric(urban == "Urban"),
+      z_active_mean = rowMeans(across(c(z_mean_1, z_mean_7, z_mean_10))),
+      z_std         = as.numeric(scale(z_active_mean)),
+      age_std       = as.numeric(scale(age)),
+      sex_bin       = as.numeric(sex == "Female"),
+      educ_std      = as.numeric(scale(as.numeric(as.character(education)))),
+      year_fact     = factor(survey_year),
+      prov_id       = as.integer(factor(province_code)),
+      region_id     = as.integer(factor(region)),
+      spatial_id    = if (all(is.na(prov_id))) region_id else prov_id
+    )
+}
+
+# BYM2: drops unmatched codes, uses graph-aligned spatial_id
+prepare_dat_bym <- function(dat_m) {
+  dat_m %>%
+    filter(province_code %in% valid_province_codes) %>%
+    mutate(
+      urban_bin     = as.numeric(urban == "Urban"),
+      z_active_mean = rowMeans(across(c(z_mean_1, z_mean_7, z_mean_10))),
+      z_std         = as.numeric(scale(z_active_mean)),
+      age_std       = as.numeric(scale(age)),
+      sex_bin       = as.numeric(sex == "Female"),
+      educ_std      = as.numeric(scale(as.numeric(as.character(education)))),
+      year_fact     = factor(survey_year),
+      spatial_id    = node_lookup$graph_node[
+                        match(province_code, node_lookup$province_code)
+                      ]
+    )
+}
+
+# Final verification
+test_bym <- inla_input %>% filter(imputation_id == 1) %>% prepare_dat_bym()
+cat("\nBYM2 data verification:\n")
+cat("  NAs in spatial_id :", sum(is.na(test_bym$spatial_id)), " (must be 0)\n")
+cat("  spatial_id range  :", paste(range(test_bym$spatial_id), collapse = " – "), "\n")
+cat("  graph$n           :", graph$n, "\n")
+cat("  max <= graph$n    :", max(test_bym$spatial_id) <= graph$n, " (must be TRUE)\n")
+cat("  Rows in BYM2 data :", nrow(test_bym), "\n")
+
+# ── 8. Fit IID vs BYM2 across all 5 imputations ───────────────────────────────
+M        <- 5
+n_obs    <- 90515
+df_m1    <- 29089
+
+rubin_pool <- function(Q_vec, U_vec, df_adj) {
+  Q_bar <- mean(Q_vec)
+  U_bar <- mean(U_vec)
+  B     <- var(Q_vec)
+  T_var <- U_bar + (1 + 1/length(Q_vec)) * B
+  SE_p  <- sqrt(T_var)
+  t_c   <- qt(0.975, df = df_adj)
+  data.frame(
+    MATE     = round(Q_bar, 4),
+    SE       = round(SE_p, 4),
+    CI_low   = round(Q_bar - t_c * SE_p, 4),
+    CI_high  = round(Q_bar + t_c * SE_p, 4),
+    MATE_exp = round(exp(Q_bar), 4)
+  )
+}
+
+pool_model <- function(fits, n_obs) {
+  mate_tbl <- lapply(fits, function(f) {
+    row <- f$summary.fixed["urban_bin", ]
+    data.frame(Q = row$mean, U = row$sd^2)
+  }) %>% bind_rows()
+
+  M_f    <- nrow(mate_tbl)
+  n_par  <- nrow(fits[[1]]$summary.fixed)
+  B      <- var(mate_tbl$Q)
+  U_bar  <- mean(mate_tbl$U)
+  T_var  <- U_bar + (1 + 1/M_f) * B
+  lambda <- (1 + 1/M_f) * B / T_var
+  df_old <- (M_f - 1) / max(lambda, 1e-10)^2
+  df_obs <- (n_obs - n_par) * (1 - lambda)
+  df_adj <- (df_old * df_obs) / (df_old + df_obs)
+
+  rubin_pool(mate_tbl$Q, mate_tbl$U, df_adj)
+}
+
+fits_iid            <- vector("list", M)   # full IID
+fits_iid_restricted <- vector("list", M)   # IID on BYM2-eligible provinces only
+fits_bym            <- vector("list", M)   # BYM2
+
+dic_table <- data.frame(
+  imputation    = 1:M,
+  DIC_IID       = NA_real_,
+  DIC_IID_restr = NA_real_,
+  DIC_BYM       = NA_real_,
+  WAIC_IID      = NA_real_,
+  WAIC_IID_restr= NA_real_,
+  WAIC_BYM      = NA_real_,
+  n_iid         = NA_integer_,
+  n_bym         = NA_integer_
+)
+
+for (m in 1:M) {
+  cat(sprintf("\n── Imputation %d/%d ──\n", m, M))
+
+  dat_iid <- inla_input %>% filter(imputation_id == m) %>% prepare_dat_iid()
+  dat_bym <- inla_input %>% filter(imputation_id == m) %>% prepare_dat_bym()
+
+  dic_table$n_iid[m] <- nrow(dat_iid)
+  dic_table$n_bym[m] <- nrow(dat_bym)
+
+  # ── IID full ──────────────────────────────────────────────────────────────
+  cat("  Fitting IID (full)...")
+  fits_iid[[m]] <- inla(
+    log_uic ~ urban_bin + z_std + age_std + sex_bin + educ_std + year_fact +
+      f(spatial_id, model = "iid",
+        hyper = list(prec = list(prior = "pc.prec", param = c(1.0, 0.01)))),
+    family            = "gaussian",
+    data              = dat_iid,
+    weights           = dat_iid$weight,
+    control.compute   = list(dic = TRUE, waic = TRUE),
+    control.predictor = list(compute = FALSE)
+  )
+  cat(sprintf(" DIC = %.2f\n", fits_iid[[m]]$dic$dic))
+  dic_table$DIC_IID[m]  <- fits_iid[[m]]$dic$dic
+  dic_table$WAIC_IID[m] <- fits_iid[[m]]$waic$waic
+  
+# ── SPATIAL RANDOM EFFECTS ──────────────────────────────────
+# Model: f(spatial_id, model = "iid", ...)
+# 
+# Interpretation:
+#   NOT a general "unmeasured confounding" adjustment
+#   Rather: Geographic variation in the urbanicity→iodine effect
+#   Reasons for variation might include:
+#     • Regional salt iodization programs (policy-level)
+#     • Migration patterns (rural→urban diffusion)
+#     • Local dietary practices (spatial clustering)
+#     • Measured confounders vary geographically
+#     • Unmeasured geographic confounders
+# 
+# Spatial REs estimate province-level deviations from average effect
+# ─────────────────────────────────────────────────────────────
+
+  # ── IID restricted (same n as BYM2) ───────────────────────────────────────
+  dat_iid_r <- dat_bym %>%
+    mutate(spatial_id = as.integer(factor(province_code)))
+
+  cat("  Fitting IID (restricted)...")
+  fits_iid_restricted[[m]] <- inla(
+    log_uic ~ urban_bin + z_std + age_std + sex_bin + educ_std + year_fact +
+      f(spatial_id, model = "iid",
+        hyper = list(prec = list(prior = "pc.prec", param = c(1.0, 0.01)))),
+    family            = "gaussian",
+    data              = dat_iid_r,
+    weights           = dat_iid_r$weight,
+    control.compute   = list(dic = TRUE, waic = TRUE),
+    control.predictor = list(compute = FALSE)
+  )
+  cat(sprintf(" DIC = %.2f\n", fits_iid_restricted[[m]]$dic$dic))
+  dic_table$DIC_IID_restr[m]  <- fits_iid_restricted[[m]]$dic$dic
+  dic_table$WAIC_IID_restr[m] <- fits_iid_restricted[[m]]$waic$waic
+
+  # ── BYM2 ──────────────────────────────────────────────────────────────────
+  cat("  Fitting BYM2...")
+  fits_bym[[m]] <- inla(
+    log_uic ~ urban_bin + z_std + age_std + sex_bin + educ_std + year_fact +
+      f(spatial_id, model = "bym2", graph = graph,
+        adjust.for.con.comp = TRUE,
+        hyper = list(
+          phi  = list(prior = "pc", param = c(0.5, 0.5)),
+          prec = list(prior = "pc.prec", param = c(1.0, 0.01))
+        )),
+    family            = "gaussian",
+    data              = dat_bym,
+    weights           = dat_bym$weight,
+    control.compute   = list(dic = TRUE, waic = TRUE),
+    control.predictor = list(compute = FALSE)
+  )
+  cat(sprintf(" DIC = %.2f\n", fits_bym[[m]]$dic$dic))
+  dic_table$DIC_BYM[m]  <- fits_bym[[m]]$dic$dic
+  dic_table$WAIC_BYM[m] <- fits_bym[[m]]$waic$waic
+}
+
+# ── Pool MATE estimates ────────────────────────────────────────────────────────
+n_bym_obs <- round(mean(dic_table$n_bym))
+
+mate_iid   <- pool_model(fits_iid,            n_obs)
+mate_iid_r <- pool_model(fits_iid_restricted, n_bym_obs)
+mate_bym   <- pool_model(fits_bym,            n_bym_obs)
+
+cat("\n═══ MODEL COMPARISON SUMMARY ═══\n")
+
+comparison_fair <- data.frame(
+  Model     = c("IID (full n)", "IID (matched n)", "BYM2"),
+  n         = c(n_obs, n_bym_obs, n_bym_obs),
+  MATE      = c(mate_iid$MATE,     mate_iid_r$MATE,    mate_bym$MATE),
+  CI_low    = c(mate_iid$CI_low,   mate_iid_r$CI_low,  mate_bym$CI_low),
+  CI_high   = c(mate_iid$CI_high,  mate_iid_r$CI_high, mate_bym$CI_high),
+  MATE_exp  = c(mate_iid$MATE_exp, mate_iid_r$MATE_exp,mate_bym$MATE_exp),
+  DIC_mean  = c(mean(dic_table$DIC_IID),
+                mean(dic_table$DIC_IID_restr),
+                mean(dic_table$DIC_BYM)),
+  delta_DIC = c(NA, NA,
+                mean(dic_table$DIC_BYM) - mean(dic_table$DIC_IID_restr))
+)
+
+print(comparison_fair)
+cat(sprintf("\nFair ΔDIC (BYM2 − IID matched): %.2f\n",
+            mean(dic_table$DIC_BYM) - mean(dic_table$DIC_IID_restr)))
+cat("Negative = BYM2 fits better on same data\n")
+print(dic_table)
+
+write.csv(comparison_fair, "iid_vs_bym2_fair_comparison.csv", row.names = FALSE)
+write.csv(dic_table,       "iid_vs_bym2_dic_by_imputation.csv", row.names = FALSE)
+cat("\nAll outputs saved.\n")
+```
+
+
+
+```{r bym-poolre, cache=FALSE}
+# ── 10. Extract and pool BYM2 spatial random effects ──────────────────────────
+set.seed(0942)
+n_nodes <- graph$n
+
+spatial_re_bym <- lapply(1:M, function(m) {
+  fits_bym[[m]]$summary.random$spatial_id %>%
+    slice(1:n_nodes) %>%
+    filter(ID %in% node_lookup$graph_node) %>%
+    select(ID, mean) %>%
+    rename(graph_node = ID, re_mean = mean) %>%
+    mutate(imputation = m)
+}) %>%
+  bind_rows() %>%
+  group_by(graph_node) %>%
+  summarise(re_bym_pooled = mean(re_mean), .groups = "drop")
+
+cat("BYM2 spatial RE extracted:", nrow(spatial_re_bym), "nodes\n")
+
+# ── 11. Map BYM2 RE back to ADM2_PCODE via node_lookup ───────────────────────
+
+stopifnot(
+  "ADM2_PCODE" %in% names(shp_order),
+  "graph_node" %in% names(shp_order)
+)
+
+node_to_pcode <- shp_order %>%
+  select(ADM2_PCODE, graph_node)
+
+re_bym_by_pcode <- spatial_re_bym %>%
+  left_join(node_to_pcode, by = "graph_node") %>%
+  filter(!is.na(ADM2_PCODE)) %>%
+  group_by(ADM2_PCODE) %>%
+  summarise(re_bym_pooled = mean(re_bym_pooled, na.rm = TRUE), .groups = "drop")
+
+cat("BYM2 RE matched to PCODEs:", nrow(re_bym_by_pcode), "\n")
+
+# ── 12. Merge IID and BYM2 RE for comparison map ──────────────────────────────
+
+re_compare <- re_by_pcode %>%
+  rename(re_iid_pooled = re_pooled) %>%
+  left_join(re_bym_by_pcode, by = "ADM2_PCODE")
+
+cat("Provinces with IID RE :", sum(!is.na(re_compare$re_iid_pooled)), "\n")
+cat("Provinces with BYM2 RE:", sum(!is.na(re_compare$re_bym_pooled)), "\n")
+
+map_compare <- shp %>%
+  left_join(re_compare, by = "ADM2_PCODE")
+
+# ── 13. Shared fill scale ──────────────────────────────────────────────────────
+
+re_range <- range(
+  c(re_compare$re_iid_pooled, re_compare$re_bym_pooled),
+  na.rm = TRUE
+)
+re_limit <- max(abs(re_range))
+
+fill_scale <- function() {
+  scale_fill_gradient2(
+    low      = "#4a7a10",
+    mid      = "#fdfbc8",
+    high     = "#3c0f5b",
+    midpoint = 0,
+    limits   = c(-re_limit, re_limit),
+    na.value = "grey85",
+    name     = "Spatial RE\n(log UIC)"
+  )
+}
+
+# ── 14. Plot ───────────────────────────────────────────────────────────────────
+
+p_iid <- ggplot(map_compare) +
+  geom_sf(aes(fill = re_iid_pooled), color = "#fdfbc8", linewidth = 0.1) +
+  fill_scale() +
+  labs(
+    title    = "IID Model",
+    subtitle = "Independent spatial random effects"
+  ) +
+  theme_void() +
+  theme(
+    plot.title    = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(size = 10, color = "grey40"),
+    legend.position = "right"
+  )
+
+p_bym <- ggplot(map_compare) +
+  geom_sf(aes(fill = re_bym_pooled), color = "#fdfbc8", linewidth = 0.1) +
+  fill_scale() +
+  labs(
+    title    = "BYM2 Model",
+    subtitle = "Spatially structured + unstructured RE"
+  ) +
+  theme_void() +
+  theme(
+    plot.title    = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(size = 10, color = "grey40"),
+    legend.position = "right"
+  )
+
+combined_map <- (p_iid | p_bym) +
+  plot_layout(guides = "collect") +
+  plot_annotation(
+    title    = "Spatial Random Effects — IID vs BYM2",
+    subtitle = "Posterior means pooled across M = 5 imputations | ENNS 2018–2021",
+    caption  = sprintf(
+      paste0(
+        "Grey = missing data. IID: %d provinces. BYM2: %d provinces ",
+        "(20 province codes dropped — HUCs or graph-unmatched).\n",
+        "Boundary: NAMRIA/PSA via HDX"
+      ),
+      sum(!is.na(re_compare$re_iid_pooled)),
+      sum(!is.na(re_compare$re_bym_pooled))
+    ),
+    theme = theme(
+      plot.title    = element_text(face = "bold", size = 16),
+      plot.subtitle = element_text(size = 10, color = "grey40"),
+      plot.caption  = element_text(size = 10, color = "grey50")
+    )
+  )
+
+ggsave("iid_vs_bym2_spatial_map.pdf", combined_map,
+       width = 16, height = 10, device = "pdf")
+cat("iid_vs_bym2_spatial_map.pdf saved!\n")
+```
+
+```{r diff-map, cache=FALSE}
+set.seed(0942)
+# ── 15. Difference map (BYM2 − IID) ──────────────────────────────────────────
+re_compare <- re_compare %>%
+  mutate(re_diff = re_bym_pooled - re_iid_pooled)
+
+map_compare <- shp %>%
+  left_join(re_compare, by = "ADM2_PCODE")
+
+diff_limit <- max(abs(re_compare$re_diff), na.rm = TRUE)
+
+p_diff <- ggplot(map_compare) +
+  geom_sf(aes(fill = re_diff, coord_sf(expand = FALSE)), 
+          color = "#fdfbc8", linewidth = 0.1) +
+  scale_fill_gradient2(
+    low      = "#4a7a10",   # green = BYM2 pulled negative
+    mid      = "#fdfbc8",
+    high     = "#3c0f5b",   # purple = BYM2 pulled positive
+    midpoint = 0,
+    limits   = c(-diff_limit, diff_limit),
+    na.value = "grey85",
+    name     = "Δ RE\n(BYM2 − IID)"
+  ) +
+  labs(
+    title    = "Difference (BYM2 − IID)",
+    subtitle = "Positive = BYM2 higher; Negative = BYM2 lower"
+  ) +
+  theme_void() +
+  theme(
+    plot.title    = element_text(face = "bold", size = 18),
+    plot.subtitle = element_text(size = 12, color = "grey40"),
+    legend.position = "right"
+  )
+
+# ── 16. Scatter plot: IID vs BYM2 RE with province labels ────────────────────
+
+library(ggrepel)
+
+# Label only provinces where the difference is large
+label_threshold <- quantile(abs(re_compare$re_diff), 0.85, na.rm = TRUE)
+
+scatter_data <- re_compare %>%
+  filter(!is.na(re_iid_pooled), !is.na(re_bym_pooled)) %>%
+  left_join(
+    shp %>% st_drop_geometry() %>% select(ADM2_PCODE, ADM2_EN),
+    by = "ADM2_PCODE"
+  ) %>%
+  mutate(label = ifelse(abs(re_diff) >= label_threshold, ADM2_EN, NA))
+
+p_scatter <- ggplot(scatter_data, aes(x = re_iid_pooled, y = re_bym_pooled)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed",
+              color = "grey50", linewidth = 0.5) +   # y = x reference line
+  geom_point(aes(color = re_diff), size = 2.5, alpha = 0.8) +
+  geom_text_repel(
+    aes(label = label),
+    size = 2.8, max.overlaps = 20,
+    segment.color = "grey60", segment.size = 0.3
+  ) +
+  scale_color_gradient2(
+    low = "#4a7a10", mid = "#fdfbc8", high =  "#3c0f5b",
+    midpoint = 0, name = "Δ RE\n(BYM2 − IID)"
+  ) +
+  labs(
+    title    = "IID vs BYM2 Spatial Random Effects",
+    subtitle = "Points on the dashed line = no change; deviation = spatial smoothing effect",
+    x        = "IID RE (log UIC)",
+    y        = "BYM2 RE (log UIC)"
+  ) +
+  theme_minimal(base_size = 15) +
+  theme(
+    plot.title    = element_text(face = "bold", size = 18),
+    plot.subtitle = element_text(size = 10, color = "grey40"),
+    legend.position = "right"
+  )
+
+# ── 17. Save both ─────────────────────────────────────────────────────────────
+
+combined_map3 <- (p_diff) +
+  plot_layout(guides = "collect") +
+  plot_annotation(
+    title    = "Spatial Random Effects — IID vs BYM2",
+    subtitle = "Posterior means pooled across M = 5 imputations | ENNS 2018–2021",
+    caption  = sprintf(
+      paste0(
+        "Grey = missing data. IID: %d provinces. BYM2: %d provinces ",
+        "(20 province codes dropped — HUCs or graph-unmatched).\n",
+        "Boundary: NAMRIA/PSA via HDX"
+      ),
+      sum(!is.na(re_compare$re_iid_pooled)),
+      sum(!is.na(re_compare$re_bym_pooled))
+    ),
+    theme = theme(
+      plot.title    = element_text(face = "bold", size = 18),
+      plot.subtitle = element_text(size = 10, color = "grey40"),
+      plot.caption  = element_text(size = 10, color = "grey50"),
+      plot.margin = margin(t=-10)
+    )
+  )
+
+ggsave("iid_vs_bym2_spatial_map3.pdf", combined_map3,
+       width = 15, height = 10, device = "pdf")
+
+ggsave("iid_vs_bym2_scatter.pdf", p_scatter,
+       width = 8, height = 7, device = "pdf")
+
+cat("iid_vs_bym2_spatial_map3.pdf saved!\n")
+cat("iid_vs_bym2_scatter.pdf saved!\n")
+```
+
+```{r save-inla-workspace, include=FALSE}
+workspace_path <- "~/thesis_char/Thesis/inla_workspace.RData"
+
+objects_to_save <- c(
+  # INLA M1, M2, M3 fits & results
+  "inla_fits",           # Main 3-model comparison fits
+  "mate_results",        # Pooled MATE estimates
+  "fit_comparison",      # DIC/WAIC comparison
+  
+  # BYM spatial components (CRITICAL for mapping)
+  "fits_iid",            # IID full fits
+  "fits_iid_restricted", # IID restricted fits
+  "fits_bym",            # BYM2 fits
+  
+  # BYM results & comparison
+  "mate_iid",            # Pooled MATE (IID full)
+  "mate_iid_r",          # Pooled MATE (IID restricted)
+  "mate_bym",            # Pooled MATE (BYM2)
+  "comparison_fair",     # Fair comparison table
+  "dic_table",           # DIC/WAIC by imputation
+  
+  # Spatial graph metadata (CRITICAL - needed if sensitivity reuses these)
+  "graph",               # Adjacency graph for BYM2
+  "node_lookup",         # Graph node → province_code mapping
+  "shp_order",           # Shapefile row order
+  "valid_province_codes",# Provinces matched to graph
+  "nb",                  # Neighbor list
+  "crosswalk"            # Province code crosswalk
+)
+
+# Only save what exists
+objects_to_save <- objects_to_save[objects_to_save %in% ls()]
+
+save(list = objects_to_save, file = workspace_path)
+
+cat("✓ INLA workspace saved:", round(file.info(workspace_path)$size / 1e6, 1), "MB\n")
+cat("Objects saved:", length(objects_to_save), "\n")
+```
+
